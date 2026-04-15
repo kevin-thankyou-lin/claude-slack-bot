@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,18 @@ logger = structlog.get_logger()
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
-STREAM_FLUSH_INTERVAL = 1.5  # seconds between Slack message updates
+STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
+STREAM_FIRST_POST_DELAY = 2.0  # wait this long before first post (avoids flicker for fast replies)
 
 
 class _StreamBuffer:
-    """Accumulates text deltas and flushes to a single Slack message."""
+    """Accumulates text deltas and posts a single Slack message.
+
+    Posts the first message after STREAM_FIRST_POST_DELAY, then updates
+    it in-place every STREAM_FLUSH_INTERVAL. On finalize, removes the
+    typing indicator. If the response finishes before the first post
+    delay, posts just once with no indicator.
+    """
 
     def __init__(self, thread_ts: str, say: Any, client: Any) -> None:
         self.thread_ts = thread_ts
@@ -35,27 +43,32 @@ class _StreamBuffer:
         self._slack_msg_ts: str | None = None
         self._channel_id: str | None = None
         self._dirty = False
+        self._first_delta_time: float | None = None
 
     async def append(self, delta: str) -> None:
         self._text += delta
         self._dirty = True
-        # Post first message immediately so user sees activity
-        if self._slack_msg_ts is None:
-            await self.flush()
+        if self._first_delta_time is None:
+            self._first_delta_time = time.monotonic()
 
     async def flush(self) -> None:
         if not self._dirty or not self._text:
             return
+
+        # Don't post yet if we're still within the first-post delay
+        if self._slack_msg_ts is None and self._first_delta_time is not None:
+            elapsed = time.monotonic() - self._first_delta_time
+            if elapsed < STREAM_FIRST_POST_DELAY:
+                return
+
         self._dirty = False
 
         if self._slack_msg_ts is None:
-            # First post
             result = await self._say(text=self._text + " :writing_hand:", thread_ts=self.thread_ts)
             if isinstance(result, dict):
                 self._slack_msg_ts = result.get("ts")
                 self._channel_id = result.get("channel")
         elif self._channel_id:
-            # Update existing message
             try:
                 await self._client.chat_update(
                     channel=self._channel_id,
@@ -66,8 +79,10 @@ class _StreamBuffer:
                 logger.warning("stream_buffer.update_failed", thread_ts=self.thread_ts)
 
     async def finalize(self) -> str:
-        """Final flush — remove typing indicator, return full text."""
-        if self._slack_msg_ts and self._channel_id and self._text:
+        """Post final text — no typing indicator."""
+        self._dirty = False
+        if self._slack_msg_ts and self._channel_id:
+            # Update existing message to remove indicator
             try:
                 await self._client.chat_update(
                     channel=self._channel_id,
@@ -76,6 +91,9 @@ class _StreamBuffer:
                 )
             except Exception:
                 logger.warning("stream_buffer.finalize_failed", thread_ts=self.thread_ts)
+        elif self._text:
+            # Never posted yet (fast response) — post once cleanly
+            await self._say(text=self._text, thread_ts=self.thread_ts)
         return self._text
 
     @property
