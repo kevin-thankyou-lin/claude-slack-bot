@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
+from typing import Any
 
+import aiohttp
 import structlog
 from slack_bolt.async_app import AsyncApp
 
@@ -9,6 +12,39 @@ from ..core.coordinator import ThreadCoordinator
 from ..core.permissions import PermissionManager
 
 logger = structlog.get_logger()
+
+DOWNLOAD_DIR = "/tmp/claude-slack-files"
+
+
+async def _download_files(files: list[dict[str, Any]], client: Any) -> list[str]:
+    """Download Slack file attachments to local disk, return file paths."""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    paths: list[str] = []
+
+    for f in files:
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+
+        filename = f.get("name", f.get("id", "unknown"))
+        local_path = os.path.join(DOWNLOAD_DIR, f"{f.get('id', 'f')}_{filename}")
+
+        try:
+            # Slack files need the bot token for auth
+            token = client.token if hasattr(client, "token") else ""
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers={"Authorization": f"Bearer {token}"}) as resp:
+                    if resp.status == 200:
+                        with open(local_path, "wb") as fp:
+                            fp.write(await resp.read())
+                        paths.append(local_path)
+                        logger.info("file_download.ok", filename=filename, path=local_path)
+                    else:
+                        logger.warning("file_download.failed", filename=filename, status=resp.status)
+        except Exception:
+            logger.exception("file_download.error", filename=filename)
+
+    return paths
 
 
 def register_listeners(
@@ -27,6 +63,14 @@ def register_listeners(
 
         text = event.get("text", "")
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+
+        files = event.get("files", [])
+        if files:
+            file_paths = await _download_files(files, client)
+            if file_paths:
+                file_note = "\n".join(f"[Attached file: {p}]" for p in file_paths)
+                text = f"{text}\n\n{file_note}" if text else file_note
+
         if not text:
             text = "Hello!"
 
@@ -46,6 +90,15 @@ def register_listeners(
 
         text = event.get("text", "")
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+
+        # Download any attached files (images, etc.) and append paths to text
+        files = event.get("files", [])
+        if files:
+            file_paths = await _download_files(files, client)
+            if file_paths:
+                file_note = "\n".join(f"[Attached file: {p}]" for p in file_paths)
+                text = f"{text}\n\n{file_note}" if text else file_note
+
         if not text:
             return
 
