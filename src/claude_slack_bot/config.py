@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     agent_id: str = ""
     agent_version: int = 1
-    default_model: str = "claude-sonnet-4-6"
+    default_model: str = "sonnet"  # "sonnet", "opus", "haiku", or full model ID
 
     # Database
     db_path: str = "data/claude_slack_bot.db"
@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     image_api_key: str = ""
 
     # Behaviour
-    default_backend: str = "messages"  # "managed" or "messages"
+    default_backend: str = "claude-code"  # "claude-code", "messages", or "managed"
     max_turns_per_thread: int = 200
     summary_interval_turns: int = 5
     confirmation_timeout_seconds: int = 300

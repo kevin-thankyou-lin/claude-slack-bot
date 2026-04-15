@@ -8,7 +8,6 @@ from typing import Any
 import structlog
 
 from ..agent.backend import EventType, SessionEvent
-from ..agent.messages import MessagesBackend
 from ..core.media import handle_custom_tool
 from ..db import queries
 from ..db.database import Database
@@ -20,13 +19,11 @@ logger = structlog.get_logger()
 
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
-_TOOL_EXECUTORS: dict[str, Any] = {}  # populated in _execute_tool via dispatch
-
 
 class ThreadCoordinator:
     """Maps Slack threads to agent sessions and orchestrates the conversation loop."""
 
-    def __init__(self, backend: MessagesBackend, db: Database) -> None:
+    def __init__(self, backend: Any, db: Database) -> None:
         self.backend = backend
         self.db = db
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -110,6 +107,10 @@ class ThreadCoordinator:
             else:
                 async with self.db._connect() as db:
                     await queries.add_message(db, thread_ts, "user", text)
+
+            # Sync auto-approve state to backend (relevant for Claude Code CLI)
+            if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
+                self.backend.set_auto_approve(thread.session_id, enabled=True)
 
             async for event in self.backend.send_message(thread.session_id, text):
                 await self._handle_event(event, thread_ts, thread.session_id, say, client)

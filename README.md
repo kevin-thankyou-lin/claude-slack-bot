@@ -12,7 +12,7 @@ Talk to Claude by @mentioning the bot in any channel. Claude responds in a threa
 - **Permission system** — tool use requires approval via Slack buttons (Allow / Deny / Auto-approve)
 - **Auto-approve mode** — toggle per-thread to skip permission prompts
 - **Conversation summaries** — Claude automatically appends a summary to each response
-- **Dual backend** — Messages API (stable) or Managed Agents API (beta, stateful sessions)
+- **Three backends** — Claude Code CLI (uses your subscription, no API key), Messages API, or Managed Agents API
 
 ## Quick start
 
@@ -22,9 +22,12 @@ cd claude-slack-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
-# Edit .env with your tokens (see Slack App Setup below)
+# Edit .env with your Slack tokens (see Slack App Setup below)
+# No API key needed — uses your Claude Code subscription by default
 python -m claude_slack_bot.main
 ```
+
+> **No Anthropic API key?** The default `claude-code` backend uses your existing Claude subscription via the `claude` CLI. Just make sure you've run `claude auth` first.
 
 ## Slack App Setup
 
@@ -95,15 +98,15 @@ Copy `.env.example` to `.env` and fill in:
 ```bash
 SLACK_BOT_TOKEN=xoxb-...          # From step 6
 SLACK_APP_TOKEN=xapp-...          # From step 2
-ANTHROPIC_API_KEY=sk-ant-...      # From console.anthropic.com
+# That's it! No API key needed with the default claude-code backend.
 ```
 
 Optional settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEFAULT_BACKEND` | `messages` | `messages` (stable) or `managed` (beta, stateful) |
-| `DEFAULT_MODEL` | `claude-sonnet-4-6` | Anthropic model to use |
+| `DEFAULT_BACKEND` | `claude-code` | `claude-code` (uses subscription), `messages` (API), or `managed` (beta) |
+| `DEFAULT_MODEL` | `sonnet` | `sonnet`, `opus`, `haiku`, or full model ID |
 | `DB_PATH` | `data/claude_slack_bot.db` | SQLite database path |
 | `SUMMARY_INTERVAL_TURNS` | `5` | Post a summary every N turns |
 | `CONFIRMATION_TIMEOUT_SECONDS` | `300` | Auto-expire unanswered permission prompts |

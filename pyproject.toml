@@ -54,6 +54,7 @@ lint.ignore = [
 ]
 lint.extend-select = ["E501"]
 lint.exclude = ["*.ipynb"]
+lint.per-file-ignores = {"src/claude_slack_bot/main.py" = ["PLC0415"]}
 
 [tool.ruff.format]
 docstring-code-format = true
