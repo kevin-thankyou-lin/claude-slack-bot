@@ -23,19 +23,21 @@ async def get_thread(db: aiosqlite.Connection, thread_ts: str) -> Thread | None:
         auto_approve=bool(row["auto_approve"]),
         cwd=row["cwd"] if "cwd" in row.keys() else "",
         status=row["status"],
+        user_id=row["user_id"] if "user_id" in row.keys() else "",
     )
 
 
 async def upsert_thread(db: aiosqlite.Connection, thread: Thread) -> None:
     await db.execute(
-        """INSERT INTO threads (thread_ts, channel_id, session_id, backend_type, auto_approve, cwd, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+        """INSERT INTO threads (thread_ts, channel_id, session_id, backend_type, auto_approve, cwd, status, user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(thread_ts) DO UPDATE SET
                session_id = excluded.session_id,
                backend_type = excluded.backend_type,
                auto_approve = excluded.auto_approve,
                cwd = excluded.cwd,
                status = excluded.status,
+               user_id = excluded.user_id,
                updated_at = datetime('now')""",
         (
             thread.thread_ts,
@@ -45,6 +47,7 @@ async def upsert_thread(db: aiosqlite.Connection, thread: Thread) -> None:
             int(thread.auto_approve),
             thread.cwd,
             thread.status,
+            thread.user_id,
         ),
     )
     await db.commit()

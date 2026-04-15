@@ -23,7 +23,7 @@ _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
 STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
-STREAM_FIRST_POST_DELAY = 2.0  # wait this long before first post (avoids flicker for fast replies)
+STREAM_FIRST_POST_DELAY = 0.5  # wait this long before first post (avoids flicker for fast replies)
 
 
 class _StreamBuffer:
@@ -35,10 +35,11 @@ class _StreamBuffer:
     delay, posts just once with no indicator.
     """
 
-    def __init__(self, thread_ts: str, say: Any, client: Any) -> None:
+    def __init__(self, thread_ts: str, say: Any, client: Any, user_id: str = "") -> None:
         self.thread_ts = thread_ts
         self._say = say
         self._client = client
+        self._user_id = user_id
         self._text = ""
         self._slack_msg_ts: str | None = None
         self._channel_id: str | None = None
@@ -79,21 +80,23 @@ class _StreamBuffer:
                 logger.warning("stream_buffer.update_failed", thread_ts=self.thread_ts)
 
     async def finalize(self) -> str:
-        """Post final text — no typing indicator."""
+        """Post final text — no typing indicator. Mentions user to signal task complete."""
         self._dirty = False
+        mention = f"<@{self._user_id}> " if self._user_id else ""
+        final_text = mention + self._text if mention and self._text else self._text
         if self._slack_msg_ts and self._channel_id:
             # Update existing message to remove indicator
             try:
                 await self._client.chat_update(
                     channel=self._channel_id,
                     ts=self._slack_msg_ts,
-                    text=self._text,
+                    text=final_text,
                 )
             except Exception:
                 logger.warning("stream_buffer.finalize_failed", thread_ts=self.thread_ts)
         elif self._text:
             # Never posted yet (fast response) — post once cleanly
-            await self._say(text=self._text, thread_ts=self.thread_ts)
+            await self._say(text=final_text, thread_ts=self.thread_ts)
         return self._text
 
     @property
@@ -118,19 +121,21 @@ class ThreadCoordinator:
         text: str,
         say: Any,
         client: Any,
+        user_id: str = "",
     ) -> None:
         """Route a user message to the appropriate agent session."""
         # Handle `cd /path` command
         cd_match = re.match(r"^cd\s+(.+)$", text.strip())
         if cd_match:
-            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say)
+            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say, user_id=user_id)
             return
 
         if thread_ts in self._active and not self._active[thread_ts].done():
             logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
+            await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
             return
 
-        task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client))
+        task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id))
         self._active[thread_ts] = task
 
     def _resolve_cwd(self, path: str) -> Path | None:
@@ -153,7 +158,7 @@ class ThreadCoordinator:
 
         return None
 
-    async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any) -> None:
+    async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any, user_id: str = "") -> None:
         """Set the working directory for a thread."""
         resolved = self._resolve_cwd(path)
         if resolved is None:
@@ -173,6 +178,7 @@ class ThreadCoordinator:
                     session_id=session_id,
                     backend_type="claude-code",
                     cwd=str(resolved),
+                    user_id=user_id,
                 )
                 await queries.upsert_thread(db, thread)
             else:
@@ -205,9 +211,11 @@ class ThreadCoordinator:
 
             await queries.resolve_confirmation(db, tool_use_id, "allowed" if allowed else "denied")
 
+        user_id = thread.user_id
+
         if not allowed:
             async for event in self.backend.send_tool_confirmation(thread.session_id, tool_use_id, allowed=False):
-                await self._handle_event(event, thread_ts, thread.session_id, say, client)
+                await self._handle_event(event, thread_ts, thread.session_id, user_id, say, client)
             return
 
         tool_input = (
@@ -217,7 +225,7 @@ class ThreadCoordinator:
         )
         result = await self._execute_tool(confirmation.tool_name, tool_input)
         async for event in self.backend.send_tool_result(thread.session_id, tool_use_id, result):
-            await self._handle_event(event, thread_ts, thread.session_id, say, client)
+            await self._handle_event(event, thread_ts, thread.session_id, user_id, say, client)
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -228,6 +236,7 @@ class ThreadCoordinator:
         text: str,
         say: Any,
         client: Any,
+        user_id: str = "",
     ) -> None:
         try:
             async with self.db._connect() as db:
@@ -240,14 +249,23 @@ class ThreadCoordinator:
                     channel_id=channel_id,
                     session_id=session_id,
                     backend_type="messages",
+                    user_id=user_id,
                 )
                 async with self.db._connect() as db:
                     await queries.upsert_thread(db, thread)
                     await queries.add_message(db, thread_ts, "user", text)
                 logger.info("coordinator.new_thread", thread_ts=thread_ts, session_id=session_id)
             else:
+                # Backfill user_id if it wasn't stored on the original thread
+                if not thread.user_id and user_id:
+                    thread.user_id = user_id
+                    async with self.db._connect() as db:
+                        await queries.upsert_thread(db, thread)
                 async with self.db._connect() as db:
                     await queries.add_message(db, thread_ts, "user", text)
+
+            # Resolve effective user_id (prefer thread record, fall back to event)
+            effective_user_id = thread.user_id or user_id
 
             # Sync per-thread state to backend
             if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
@@ -258,7 +276,7 @@ class ThreadCoordinator:
             message = text
 
             # Create a stream buffer for live updates (replies go to reply_ts)
-            buf = _StreamBuffer(thread_ts, say, client)
+            buf = _StreamBuffer(thread_ts, say, client, user_id=effective_user_id)
             self._stream_buffers[thread_ts] = buf
 
             async def _periodic_flush() -> None:
@@ -269,7 +287,7 @@ class ThreadCoordinator:
             flush_task = asyncio.create_task(_periodic_flush())
             try:
                 async for event in self.backend.send_message(thread.session_id, message):
-                    await self._handle_event(event, thread_ts, thread.session_id, say, client)
+                    await self._handle_event(event, thread_ts, thread.session_id, effective_user_id, say, client)
             finally:
                 flush_task.cancel()
                 if buf.has_content:
@@ -280,8 +298,10 @@ class ThreadCoordinator:
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)
+            mention = f"<@{user_id}> " if user_id else ""
             await say(
-                text=":warning: Something went wrong processing your message. Please try again.", thread_ts=thread_ts
+                text=f"{mention}:warning: Something went wrong processing your message. Please try again.",
+                thread_ts=thread_ts,
             )
 
     async def _handle_event(
@@ -289,6 +309,7 @@ class ThreadCoordinator:
         event: SessionEvent,
         thread_ts: str,
         session_id: str,
+        user_id: str,
         say: Any,
         client: Any,
     ) -> None:
@@ -301,24 +322,27 @@ class ThreadCoordinator:
             # If we have a stream buffer, the deltas already covered this text
             buf = self._stream_buffers.get(thread_ts)
             if not buf or not buf.has_content:
-                await self._handle_text(event, thread_ts, say)
+                await self._handle_text(event, thread_ts, user_id, say)
         elif event.type == EventType.TOOL_CONFIRMATION_NEEDED:
-            await self._handle_confirmation_needed(event, thread_ts, session_id, say, client)
+            await self._handle_confirmation_needed(event, thread_ts, session_id, user_id, say, client)
         elif event.type == EventType.TOOL_USE:
-            await self._handle_tool_use(event, thread_ts, session_id, say, client)
+            await self._handle_tool_use(event, thread_ts, session_id, user_id, say, client)
         elif event.type == EventType.ERROR:
-            await say(text=f":warning: Error: {event.error_message}", thread_ts=thread_ts)
+            mention = f"<@{user_id}> " if user_id else ""
+            await say(text=f"{mention}:warning: Error: {event.error_message}", thread_ts=thread_ts)
         elif event.type == EventType.TURN_END:
             logger.info("coordinator.turn_end", thread_ts=thread_ts)
 
-    async def _handle_text(self, event: SessionEvent, thread_ts: str, say: Any) -> None:
-        result = await say(text=event.text, thread_ts=thread_ts)
+    async def _handle_text(self, event: SessionEvent, thread_ts: str, user_id: str, say: Any) -> None:
+        mention = f"<@{user_id}> " if user_id else ""
+        text = mention + event.text if mention else event.text
+        result = await say(text=text, thread_ts=thread_ts)
         slack_ts = result.get("ts") if isinstance(result, dict) else None
         async with self.db._connect() as db:
             await queries.add_message(db, thread_ts, "assistant", event.text, slack_msg_ts=slack_ts)
 
     async def _handle_confirmation_needed(
-        self, event: SessionEvent, thread_ts: str, session_id: str, say: Any, client: Any
+        self, event: SessionEvent, thread_ts: str, session_id: str, user_id: str, say: Any, client: Any
     ) -> None:
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
@@ -326,10 +350,15 @@ class ThreadCoordinator:
         if thread and thread.auto_approve:
             result = await self._execute_tool(event.tool_name, event.tool_input)
             async for follow_up in self.backend.send_tool_result(session_id, event.tool_use_id, result):
-                await self._handle_event(follow_up, thread_ts, session_id, say, client)
+                await self._handle_event(follow_up, thread_ts, session_id, user_id, say, client)
         else:
+            mention = f"<@{user_id}> " if user_id else ""
             blocks = build_permission_block(event.tool_name, event.tool_input, event.tool_use_id)
-            result = await say(text=f"Permission requested: `{event.tool_name}`", blocks=blocks, thread_ts=thread_ts)
+            result = await say(
+                text=f"{mention}Permission requested: `{event.tool_name}`",
+                blocks=blocks,
+                thread_ts=thread_ts,
+            )
             slack_ts = result.get("ts") if isinstance(result, dict) else None
             async with self.db._connect() as db:
                 await queries.add_pending_confirmation(
@@ -342,7 +371,7 @@ class ThreadCoordinator:
                 )
 
     async def _handle_tool_use(
-        self, event: SessionEvent, thread_ts: str, session_id: str, say: Any, client: Any
+        self, event: SessionEvent, thread_ts: str, session_id: str, user_id: str, say: Any, client: Any
     ) -> None:
         if event.tool_name in _CUSTOM_TOOLS:
             result = await self._handle_custom_tool(event, thread_ts, say, client)
@@ -354,7 +383,7 @@ class ThreadCoordinator:
             )
 
         async for follow_up in self.backend.send_tool_result(session_id, event.tool_use_id, result):
-            await self._handle_event(follow_up, thread_ts, session_id, say, client)
+            await self._handle_event(follow_up, thread_ts, session_id, user_id, say, client)
 
     async def _handle_custom_tool(self, event: SessionEvent, thread_ts: str, say: Any, client: Any) -> str:
         channel_id = await self._get_channel_id(thread_ts)

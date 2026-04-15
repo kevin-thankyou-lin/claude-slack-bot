@@ -32,9 +32,10 @@ def register_listeners(
 
         thread_ts = event.get("thread_ts", event.get("ts", ""))
         channel_id = event.get("channel", "")
+        user_id = event.get("user", "")
 
         logger.info("listener.app_mention", channel=channel_id, thread_ts=thread_ts)
-        await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
+        await coordinator.handle_user_message(thread_ts, channel_id, text, say, client, user_id=user_id)
 
     @app.event("message")
     async def handle_message(event: dict, say: object, client: object) -> None:  # type: ignore[type-arg]
@@ -50,13 +51,14 @@ def register_listeners(
 
         channel_id = event.get("channel", "")
         channel_type = event.get("channel_type", "")
+        user_id = event.get("user", "")
 
         # DMs: each message starts a thread (same model as channels)
         # User replies in-thread continue the session
         if channel_type == "im":
             thread_ts = event.get("thread_ts", event.get("ts", ""))
             logger.info("listener.dm", channel=channel_id, thread_ts=thread_ts)
-            await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
+            await coordinator.handle_user_message(thread_ts, channel_id, text, say, client, user_id=user_id)
             return
 
         # Channels: only handle threaded replies
@@ -65,7 +67,7 @@ def register_listeners(
             return
 
         logger.info("listener.thread_reply", channel=channel_id, thread_ts=thread_ts)
-        await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
+        await coordinator.handle_user_message(thread_ts, channel_id, text, say, client, user_id=user_id)
 
     @app.action("tool_allow")
     async def handle_tool_allow(ack: object, body: dict, say: object, client: object) -> None:  # type: ignore[type-arg]

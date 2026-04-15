@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS threads (
     auto_approve    INTEGER NOT NULL DEFAULT 0,
     cwd             TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'active',
+    user_id         TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -53,7 +54,12 @@ class Database:
         os.makedirs(Path(self.db_path).parent, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(SCHEMA)
-            await db.commit()
+            # Migrate: add user_id column to existing databases
+            try:
+                await db.execute("ALTER TABLE threads ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+                await db.commit()
+            except Exception:
+                pass  # Column already exists
 
     def _connect(self) -> aiosqlite.Connection:
         return aiosqlite.connect(self.db_path)
