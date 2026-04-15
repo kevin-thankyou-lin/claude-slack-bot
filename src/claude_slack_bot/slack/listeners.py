@@ -85,7 +85,11 @@ def register_listeners(
     async def handle_message(event: dict, say: object, client: object) -> None:  # type: ignore[type-arg]
         """Handle messages in threads and DMs."""
         # Ignore bot messages (including our own)
-        if event.get("bot_id") or event.get("subtype"):
+        if event.get("bot_id"):
+            return
+        # Allow file_share subtype (image attachments), ignore other subtypes
+        subtype = event.get("subtype")
+        if subtype and subtype != "file_share":
             return
 
         text = event.get("text", "")
