@@ -9,12 +9,12 @@ import structlog
 logger = structlog.get_logger()
 
 # File extensions we look for in command output
-UPLOADABLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".mp4", ".webm", ".pdf"}
+UPLOADABLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".mp4", ".webm", ".pdf", ".zip"}
 
 # Patterns that suggest a file was written
 FILE_OUTPUT_PATTERNS = [
     re.compile(r"(?:saved?|writ(?:ten|e)|output|created|generated)\s+(?:to\s+)?['\"]?(/tmp/[^\s'\"]+)", re.IGNORECASE),
-    re.compile(r"(/tmp/\S+\.(?:png|jpg|jpeg|gif|mp4|webm|pdf|svg))\b"),
+    re.compile(r"(/tmp/\S+\.(?:png|jpg|jpeg|gif|mp4|webm|pdf|svg|zip))\b"),
 ]
 
 
