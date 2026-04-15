@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -100,12 +101,44 @@ class ThreadCoordinator:
         client: Any,
     ) -> None:
         """Route a user message to the appropriate agent session."""
+        # Handle `cd /path` command — sets working directory for this thread
+        cd_match = re.match(r"^cd\s+(.+)$", text.strip())
+        if cd_match:
+            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say)
+            return
+
         if thread_ts in self._active and not self._active[thread_ts].done():
             logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
             return
 
         task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client))
         self._active[thread_ts] = task
+
+    async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any) -> None:
+        """Set the working directory for a thread."""
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            await say(text=f":x: Not a valid directory: `{path}`", thread_ts=thread_ts)
+            return
+
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+            if thread is None:
+                # Create the thread record with the cwd
+                session_id = await self.backend.create_session()
+                thread = Thread(
+                    thread_ts=thread_ts,
+                    channel_id=channel_id,
+                    session_id=session_id,
+                    backend_type="claude-code",
+                    cwd=str(resolved),
+                )
+                await queries.upsert_thread(db, thread)
+            else:
+                await queries.set_cwd(db, thread_ts, str(resolved))
+
+        await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=thread_ts)
+        logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
 
     async def handle_tool_confirmation(
         self,
@@ -175,6 +208,11 @@ class ThreadCoordinator:
             if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
                 self.backend.set_auto_approve(thread.session_id, enabled=True)
 
+            # Prepend cwd context if set for this thread
+            message = text
+            if thread.cwd:
+                message = f"[Working directory: {thread.cwd}]\nAlways `cd {thread.cwd}` before running any bash commands.\n\n{text}"
+
             # Create a stream buffer for live updates
             buf = _StreamBuffer(thread_ts, say, client)
             self._stream_buffers[thread_ts] = buf
@@ -187,7 +225,7 @@ class ThreadCoordinator:
 
             flush_task = asyncio.create_task(_periodic_flush())
             try:
-                async for event in self.backend.send_message(thread.session_id, text):
+                async for event in self.backend.send_message(thread.session_id, message):
                     await self._handle_event(event, thread_ts, thread.session_id, say, client)
             finally:
                 flush_task.cancel()

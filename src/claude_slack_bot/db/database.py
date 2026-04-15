@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS threads (
     session_id      TEXT NOT NULL,
     backend_type    TEXT NOT NULL DEFAULT 'messages',
     auto_approve    INTEGER NOT NULL DEFAULT 0,
+    cwd             TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'active',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))

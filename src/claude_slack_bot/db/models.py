@@ -11,6 +11,7 @@ class Thread:
     session_id: str
     backend_type: str = "messages"
     auto_approve: bool = False
+    cwd: str = ""
     status: str = "active"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
