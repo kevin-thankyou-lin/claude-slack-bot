@@ -6,13 +6,11 @@ from typing import AsyncIterator
 
 import structlog
 from claude_code_sdk import (
-    AssistantMessage,
     ClaudeCodeOptions,
     ClaudeSDKClient,
     ResultMessage,
-    SystemMessage,
 )
-from claude_code_sdk.types import PermissionResultAllow, StreamEvent, TextBlock, ToolPermissionContext
+from claude_code_sdk.types import PermissionResultAllow, StreamEvent, ToolPermissionContext
 
 from .backend import EventType, SessionEvent
 from .prompts import SYSTEM_PROMPT
@@ -99,7 +97,6 @@ class ClaudeCodeBackend:
         try:
             cwd = self._session_cwd.get(session_id, "")
             client = await self._get_client(cwd)
-            got_deltas = False
 
             await client.query(content, session_id=session_id)
 
@@ -107,19 +104,13 @@ class ClaudeCodeBackend:
                 if isinstance(msg, StreamEvent):
                     delta_text = self._extract_text_delta(msg)
                     if delta_text:
-                        got_deltas = True
                         yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
-                elif isinstance(msg, AssistantMessage):
-                    if not got_deltas:
-                        for block in msg.content:
-                            if isinstance(block, TextBlock) and block.text:
-                                yield SessionEvent(type=EventType.TEXT, text=block.text)
-                    got_deltas = False
                 elif isinstance(msg, ResultMessage):
                     yield SessionEvent(type=EventType.TURN_END, is_final=True)
                     return
-                elif isinstance(msg, SystemMessage):
-                    pass
+                # AssistantMessage and SystemMessage are skipped — with
+                # include_partial_messages=True, all text arrives via StreamEvent
+                # deltas. Emitting AssistantMessage text too causes duplicates.
 
             yield SessionEvent(type=EventType.TURN_END, is_final=True)
 
