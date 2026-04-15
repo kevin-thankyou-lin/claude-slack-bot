@@ -222,7 +222,7 @@ class ThreadCoordinator:
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
             if thread and hasattr(self.backend, "interrupt"):
-                self.backend.interrupt(thread.session_id)
+                await self.backend.interrupt(thread.session_id)
 
             task.cancel()
             self._active.pop(thread_ts, None)

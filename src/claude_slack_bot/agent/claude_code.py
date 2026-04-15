@@ -75,10 +75,10 @@ class ClaudeCodeBackend:
         return session_id
 
     async def set_session_cwd(self, session_id: str, cwd: str) -> None:
+        old_cwd = self._session_cwd.get(session_id)
         self._session_cwd[session_id] = cwd
-        # If client already exists for this session, disconnect it
-        # so it reconnects with the new cwd on next message
-        if session_id in self._clients:
+        # Only reset client if cwd actually changed
+        if old_cwd != cwd and session_id in self._clients:
             await self._reset_client(session_id)
 
     def set_auto_approve(self, session_id: str, *, enabled: bool) -> None:
@@ -87,7 +87,7 @@ class ClaudeCodeBackend:
         else:
             self._auto_approve.discard(session_id)
 
-    def interrupt(self, session_id: str) -> None:
+    async def interrupt(self, session_id: str) -> None:
         """Interrupt the running query for a session."""
         client = self._clients.get(session_id)
         if client:
