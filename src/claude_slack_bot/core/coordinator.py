@@ -204,7 +204,7 @@ class ThreadCoordinator:
 
         # Tell the backend which cwd this session should use
         if hasattr(self.backend, "set_session_cwd"):
-            self.backend.set_session_cwd(thread.session_id, str(resolved))
+            await self.backend.set_session_cwd(thread.session_id, str(resolved))
 
         await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=thread_ts)
         logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
@@ -289,7 +289,7 @@ class ThreadCoordinator:
             if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
                 self.backend.set_auto_approve(thread.session_id, enabled=True)
             if thread.cwd and hasattr(self.backend, "set_session_cwd"):
-                self.backend.set_session_cwd(thread.session_id, thread.cwd)
+                await self.backend.set_session_cwd(thread.session_id, thread.cwd)
 
             message = text
 

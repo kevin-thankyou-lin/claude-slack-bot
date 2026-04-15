@@ -7,7 +7,7 @@ from claude_code_sdk import ResultMessage
 from claude_code_sdk.types import StreamEvent
 
 from claude_slack_bot.agent.backend import EventType
-from claude_slack_bot.agent.claude_code import ClaudeCodeBackend, _ClientEntry
+from claude_slack_bot.agent.claude_code import ClaudeCodeBackend
 
 
 def _make_stream_delta(text: str) -> MagicMock:
@@ -22,13 +22,6 @@ def _make_result_msg(result: str | None = None) -> MagicMock:
     return msg
 
 
-def _mock_entry() -> tuple[AsyncMock, _ClientEntry]:
-    mock_client = AsyncMock()
-    mock_client.query = AsyncMock()
-    entry = _ClientEntry(mock_client)
-    return mock_client, entry
-
-
 @pytest.mark.asyncio
 async def test_create_session() -> None:
     backend = ClaudeCodeBackend()
@@ -40,7 +33,9 @@ async def test_create_session() -> None:
 @pytest.mark.asyncio
 async def test_send_message_success() -> None:
     backend = ClaudeCodeBackend()
-    mock_client, entry = _mock_entry()
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
 
     async def mock_receive() -> None:  # type: ignore[return-type]
         yield _make_stream_delta("Hello ")
@@ -48,9 +43,10 @@ async def test_send_message_success() -> None:
         yield _make_result_msg("Hello from Claude!")
 
     mock_client.receive_response = mock_receive
-    backend._entries[""] = entry
 
     session_id = await backend.create_session()
+    backend._clients[session_id] = mock_client
+
     events = []
     async for event in backend.send_message(session_id, "Hi"):
         events.append(event)
@@ -66,14 +62,16 @@ async def test_send_message_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_message_error_resets_entry() -> None:
+async def test_send_message_error_resets_client() -> None:
     backend = ClaudeCodeBackend()
-    mock_client, entry = _mock_entry()
+
+    mock_client = AsyncMock()
     mock_client.query = AsyncMock(side_effect=RuntimeError("connection lost"))
     mock_client.disconnect = AsyncMock()
-    backend._entries[""] = entry
 
     session_id = await backend.create_session()
+    backend._clients[session_id] = mock_client
+
     events = []
     async for event in backend.send_message(session_id, "Hi"):
         events.append(event)
@@ -81,7 +79,7 @@ async def test_send_message_error_resets_entry() -> None:
     assert len(events) == 1
     assert events[0].type == EventType.ERROR
     assert "connection lost" in events[0].error_message
-    assert "" not in backend._entries
+    assert session_id not in backend._clients
 
 
 @pytest.mark.asyncio
@@ -99,18 +97,35 @@ async def test_auto_approve_tracking() -> None:
 @pytest.mark.asyncio
 async def test_shutdown() -> None:
     backend = ClaudeCodeBackend()
-    mock_client, entry = _mock_entry()
-    backend._entries[""] = entry
+    mock_client = AsyncMock()
+    session_id = await backend.create_session()
+    backend._clients[session_id] = mock_client
 
     await backend.shutdown()
     mock_client.disconnect.assert_called_once()
-    assert len(backend._entries) == 0
+    assert len(backend._clients) == 0
 
 
 @pytest.mark.asyncio
-async def test_session_cwd_routing() -> None:
+async def test_session_cwd() -> None:
     backend = ClaudeCodeBackend()
     session_id = await backend.create_session()
-    backend.set_session_cwd(session_id, "/home/user/project")
-
+    await backend.set_session_cwd(session_id, "/home/user/project")
     assert backend._session_cwd[session_id] == "/home/user/project"
+
+
+@pytest.mark.asyncio
+async def test_parallel_sessions_isolated() -> None:
+    """Two sessions should use separate clients."""
+    backend = ClaudeCodeBackend()
+
+    mock_a = AsyncMock()
+    mock_b = AsyncMock()
+
+    session_a = await backend.create_session()
+    session_b = await backend.create_session()
+
+    backend._clients[session_a] = mock_a
+    backend._clients[session_b] = mock_b
+
+    assert backend._clients[session_a] is not backend._clients[session_b]
