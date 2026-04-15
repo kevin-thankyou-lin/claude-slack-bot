@@ -45,6 +45,9 @@ class _StreamBuffer:
         self._channel_id: str | None = None
         self._dirty = False
         self._first_delta_time: float | None = None
+        # Set by coordinator to track the "Thinking..." message
+        self._thinking_ts: str | None = None
+        self._thinking_channel: str | None = None
 
     async def append(self, delta: str) -> None:
         self._text += delta
@@ -65,10 +68,25 @@ class _StreamBuffer:
         self._dirty = False
 
         if self._slack_msg_ts is None:
-            result = await self._say(text=self._text + " :writing_hand:", thread_ts=self.thread_ts)
-            if isinstance(result, dict):
-                self._slack_msg_ts = result.get("ts")
-                self._channel_id = result.get("channel")
+            # Replace the "Thinking..." message if we have one
+            if self._thinking_ts and self._thinking_channel:
+                try:
+                    await self._client.chat_update(
+                        channel=self._thinking_channel,
+                        ts=self._thinking_ts,
+                        text=self._text + " :writing_hand:",
+                    )
+                    self._slack_msg_ts = self._thinking_ts
+                    self._channel_id = self._thinking_channel
+                    self._thinking_ts = None
+                    self._thinking_channel = None
+                except Exception:
+                    logger.warning("stream_buffer.thinking_update_failed", thread_ts=self.thread_ts)
+            else:
+                result = await self._say(text=self._text + " :writing_hand:", thread_ts=self.thread_ts)
+                if isinstance(result, dict):
+                    self._slack_msg_ts = result.get("ts")
+                    self._channel_id = result.get("channel")
         elif self._channel_id:
             try:
                 await self._client.chat_update(
@@ -84,14 +102,14 @@ class _StreamBuffer:
         self._dirty = False
         mention = f"<@{self._user_id}> " if self._user_id else ""
         final_text = mention + self._text if mention and self._text else self._text
-        if self._slack_msg_ts and self._channel_id:
-            # Update existing message to remove indicator
+
+        # Determine which message to update (streamed message or thinking message)
+        msg_ts = self._slack_msg_ts or self._thinking_ts
+        channel = self._channel_id or self._thinking_channel
+
+        if msg_ts and channel and final_text:
             try:
-                await self._client.chat_update(
-                    channel=self._channel_id,
-                    ts=self._slack_msg_ts,
-                    text=final_text,
-                )
+                await self._client.chat_update(channel=channel, ts=msg_ts, text=final_text)
             except Exception:
                 logger.warning("stream_buffer.finalize_failed", thread_ts=self.thread_ts)
         elif self._text:
@@ -275,8 +293,15 @@ class ThreadCoordinator:
 
             message = text
 
-            # Create a stream buffer for live updates (replies go to reply_ts)
+            # Post a "thinking" indicator immediately so user sees activity
+            thinking_result = await say(text=":brain: Thinking...", thread_ts=thread_ts)
+            thinking_ts = thinking_result.get("ts") if isinstance(thinking_result, dict) else None
+            thinking_channel = thinking_result.get("channel") if isinstance(thinking_result, dict) else None
+
+            # Create a stream buffer for live updates
             buf = _StreamBuffer(thread_ts, say, client, user_id=effective_user_id)
+            buf._thinking_ts = thinking_ts  # track so we can delete it later
+            buf._thinking_channel = thinking_channel
             self._stream_buffers[thread_ts] = buf
 
             async def _periodic_flush() -> None:
