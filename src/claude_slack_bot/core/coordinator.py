@@ -100,19 +100,27 @@ class ThreadCoordinator:
         text: str,
         say: Any,
         client: Any,
+        reply_thread_ts: str | None = None,
     ) -> None:
-        """Route a user message to the appropriate agent session."""
-        # Handle `cd /path` command — sets working directory for this thread
+        """Route a user message to the appropriate agent session.
+
+        Args:
+            thread_ts: Session key (thread_ts for channels, "dm:<channel>" for DMs).
+            reply_thread_ts: Slack thread to post replies under (defaults to thread_ts).
+        """
+        reply_to = reply_thread_ts or thread_ts
+
+        # Handle `cd /path` command
         cd_match = re.match(r"^cd\s+(.+)$", text.strip())
         if cd_match:
-            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say)
+            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say, reply_to)
             return
 
         if thread_ts in self._active and not self._active[thread_ts].done():
             logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
             return
 
-        task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client))
+        task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client, reply_to))
         self._active[thread_ts] = task
 
     def _resolve_cwd(self, path: str) -> Path | None:
@@ -135,13 +143,14 @@ class ThreadCoordinator:
 
         return None
 
-    async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any) -> None:
+    async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any, reply_to: str = "") -> None:
         """Set the working directory for a thread."""
+        reply_ts = reply_to or thread_ts
         resolved = self._resolve_cwd(path)
         if resolved is None:
             await say(
                 text=f":x: Directory not found: `{path}`\nTry a full path or folder name under `{self.projects_dir}`",
-                thread_ts=thread_ts,
+                thread_ts=reply_ts,
             )
             return
 
@@ -164,7 +173,7 @@ class ThreadCoordinator:
         if hasattr(self.backend, "set_session_cwd"):
             self.backend.set_session_cwd(thread.session_id, str(resolved))
 
-        await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=thread_ts)
+        await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=reply_ts)
         logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
 
     async def handle_tool_confirmation(
@@ -210,7 +219,9 @@ class ThreadCoordinator:
         text: str,
         say: Any,
         client: Any,
+        reply_to: str = "",
     ) -> None:
+        reply_ts = reply_to or thread_ts
         try:
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
@@ -239,11 +250,10 @@ class ThreadCoordinator:
 
             message = text
 
-            # Create a stream buffer for live updates
-            buf = _StreamBuffer(thread_ts, say, client)
-            self._stream_buffers[thread_ts] = buf
+            # Create a stream buffer for live updates (replies go to reply_ts)
+            buf = _StreamBuffer(reply_ts, say, client)
+            self._stream_buffers[reply_ts] = buf
 
-            # Periodic flush task
             async def _periodic_flush() -> None:
                 while True:
                     await asyncio.sleep(STREAM_FLUSH_INTERVAL)
@@ -252,20 +262,19 @@ class ThreadCoordinator:
             flush_task = asyncio.create_task(_periodic_flush())
             try:
                 async for event in self.backend.send_message(thread.session_id, message):
-                    await self._handle_event(event, thread_ts, thread.session_id, say, client)
+                    await self._handle_event(event, reply_ts, thread.session_id, say, client)
             finally:
                 flush_task.cancel()
-                # Finalize the stream buffer (remove typing indicator)
                 if buf.has_content:
                     final_text = await buf.finalize()
                     async with self.db._connect() as db_conn:
                         await queries.add_message(db_conn, thread_ts, "assistant", final_text)
-                self._stream_buffers.pop(thread_ts, None)
+                self._stream_buffers.pop(reply_ts, None)
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)
             await say(
-                text=":warning: Something went wrong processing your message. Please try again.", thread_ts=thread_ts
+                text=":warning: Something went wrong processing your message. Please try again.", thread_ts=reply_ts
             )
 
     async def _handle_event(
