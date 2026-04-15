@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # Claude Code working directory (where sessions run)
     cwd: str = ""  # e.g. "/home/linke/Projects/my-repo" — defaults to bot's cwd if empty
+    projects_dir: str = "/home/linke/Projects"  # parent dir to search when user types "cd gr00t"
 
     # Behaviour
     default_backend: str = "claude-code"  # "claude-code", "messages", or "managed"

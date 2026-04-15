@@ -86,9 +86,10 @@ class _StreamBuffer:
 class ThreadCoordinator:
     """Maps Slack threads to agent sessions and orchestrates the conversation loop."""
 
-    def __init__(self, backend: Any, db: Database) -> None:
+    def __init__(self, backend: Any, db: Database, projects_dir: str = "/home/linke/Projects") -> None:
         self.backend = backend
         self.db = db
+        self.projects_dir = Path(projects_dir)
         self._active: dict[str, asyncio.Task[None]] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}
 
@@ -114,17 +115,39 @@ class ThreadCoordinator:
         task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client))
         self._active[thread_ts] = task
 
+    def _resolve_cwd(self, path: str) -> Path | None:
+        """Resolve a path or folder name to an absolute directory."""
+        # Try as absolute path first
+        candidate = Path(path).expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+
+        # Try as a folder name under projects_dir
+        candidate = (self.projects_dir / path).resolve()
+        if candidate.is_dir():
+            return candidate
+
+        # Try case-insensitive match under projects_dir
+        if self.projects_dir.is_dir():
+            for child in self.projects_dir.iterdir():
+                if child.is_dir() and child.name.lower() == path.lower():
+                    return child
+
+        return None
+
     async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any) -> None:
         """Set the working directory for a thread."""
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_dir():
-            await say(text=f":x: Not a valid directory: `{path}`", thread_ts=thread_ts)
+        resolved = self._resolve_cwd(path)
+        if resolved is None:
+            await say(
+                text=f":x: Directory not found: `{path}`\nTry a full path or folder name under `{self.projects_dir}`",
+                thread_ts=thread_ts,
+            )
             return
 
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
             if thread is None:
-                # Create the thread record with the cwd
                 session_id = await self.backend.create_session()
                 thread = Thread(
                     thread_ts=thread_ts,
@@ -136,6 +159,10 @@ class ThreadCoordinator:
                 await queries.upsert_thread(db, thread)
             else:
                 await queries.set_cwd(db, thread_ts, str(resolved))
+
+        # Tell the backend which cwd this session should use
+        if hasattr(self.backend, "set_session_cwd"):
+            self.backend.set_session_cwd(thread.session_id, str(resolved))
 
         await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=thread_ts)
         logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
@@ -204,14 +231,13 @@ class ThreadCoordinator:
                 async with self.db._connect() as db:
                     await queries.add_message(db, thread_ts, "user", text)
 
-            # Sync auto-approve state to backend (relevant for Claude Code CLI)
+            # Sync per-thread state to backend
             if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
                 self.backend.set_auto_approve(thread.session_id, enabled=True)
+            if thread.cwd and hasattr(self.backend, "set_session_cwd"):
+                self.backend.set_session_cwd(thread.session_id, thread.cwd)
 
-            # Prepend cwd context if set for this thread
             message = text
-            if thread.cwd:
-                message = f"[Working directory: {thread.cwd}]\nAlways `cd {thread.cwd}` before running any bash commands.\n\n{text}"
 
             # Create a stream buffer for live updates
             buf = _StreamBuffer(thread_ts, say, client)

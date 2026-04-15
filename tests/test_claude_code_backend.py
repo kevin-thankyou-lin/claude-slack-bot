@@ -49,7 +49,8 @@ async def test_send_message_success() -> None:
         yield _make_result_msg("Hello from Claude!")
 
     mock_client.receive_response = mock_receive
-    backend._client = mock_client
+    # Use _clients dict (keyed by cwd, "" = default)
+    backend._clients[""] = mock_client
 
     session_id = await backend.create_session()
     events = []
@@ -71,7 +72,7 @@ async def test_send_message_error_resets_client() -> None:
     mock_client = AsyncMock()
     mock_client.query = AsyncMock(side_effect=RuntimeError("connection lost"))
     mock_client.disconnect = AsyncMock()
-    backend._client = mock_client
+    backend._clients[""] = mock_client
 
     session_id = await backend.create_session()
     events = []
@@ -81,7 +82,7 @@ async def test_send_message_error_resets_client() -> None:
     assert len(events) == 1
     assert events[0].type == EventType.ERROR
     assert "connection lost" in events[0].error_message
-    assert backend._client is None
+    assert "" not in backend._clients
 
 
 @pytest.mark.asyncio
@@ -100,8 +101,17 @@ async def test_auto_approve_tracking() -> None:
 async def test_shutdown() -> None:
     backend = ClaudeCodeBackend()
     mock_client = AsyncMock()
-    backend._client = mock_client
+    backend._clients[""] = mock_client
 
     await backend.shutdown()
     mock_client.disconnect.assert_called_once()
-    assert backend._client is None
+    assert len(backend._clients) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_cwd_routing() -> None:
+    backend = ClaudeCodeBackend()
+    session_id = await backend.create_session()
+    backend.set_session_cwd(session_id, "/home/user/project")
+
+    assert backend._session_cwd[session_id] == "/home/user/project"

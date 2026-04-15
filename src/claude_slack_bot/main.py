@@ -52,7 +52,7 @@ async def main() -> None:
     backend = _create_backend(settings)
 
     # Initialize core services
-    coordinator = ThreadCoordinator(backend=backend, db=db)
+    coordinator = ThreadCoordinator(backend=backend, db=db, projects_dir=settings.projects_dir)
     permission_mgr = PermissionManager(db=db)
 
     # Create and start Slack app
