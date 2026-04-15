@@ -7,7 +7,7 @@ from claude_code_sdk import ResultMessage
 from claude_code_sdk.types import StreamEvent
 
 from claude_slack_bot.agent.backend import EventType
-from claude_slack_bot.agent.claude_code import ClaudeCodeBackend
+from claude_slack_bot.agent.claude_code import ClaudeCodeBackend, _ClientEntry
 
 
 def _make_stream_delta(text: str) -> MagicMock:
@@ -22,6 +22,13 @@ def _make_result_msg(result: str | None = None) -> MagicMock:
     return msg
 
 
+def _mock_entry() -> tuple[AsyncMock, _ClientEntry]:
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    entry = _ClientEntry(mock_client)
+    return mock_client, entry
+
+
 @pytest.mark.asyncio
 async def test_create_session() -> None:
     backend = ClaudeCodeBackend()
@@ -33,9 +40,7 @@ async def test_create_session() -> None:
 @pytest.mark.asyncio
 async def test_send_message_success() -> None:
     backend = ClaudeCodeBackend()
-
-    mock_client = AsyncMock()
-    mock_client.query = AsyncMock()
+    mock_client, entry = _mock_entry()
 
     async def mock_receive() -> None:  # type: ignore[return-type]
         yield _make_stream_delta("Hello ")
@@ -43,7 +48,7 @@ async def test_send_message_success() -> None:
         yield _make_result_msg("Hello from Claude!")
 
     mock_client.receive_response = mock_receive
-    backend._clients[""] = mock_client
+    backend._entries[""] = entry
 
     session_id = await backend.create_session()
     events = []
@@ -61,13 +66,12 @@ async def test_send_message_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_message_error_resets_client() -> None:
+async def test_send_message_error_resets_entry() -> None:
     backend = ClaudeCodeBackend()
-
-    mock_client = AsyncMock()
+    mock_client, entry = _mock_entry()
     mock_client.query = AsyncMock(side_effect=RuntimeError("connection lost"))
     mock_client.disconnect = AsyncMock()
-    backend._clients[""] = mock_client
+    backend._entries[""] = entry
 
     session_id = await backend.create_session()
     events = []
@@ -77,7 +81,7 @@ async def test_send_message_error_resets_client() -> None:
     assert len(events) == 1
     assert events[0].type == EventType.ERROR
     assert "connection lost" in events[0].error_message
-    assert "" not in backend._clients
+    assert "" not in backend._entries
 
 
 @pytest.mark.asyncio
@@ -95,12 +99,12 @@ async def test_auto_approve_tracking() -> None:
 @pytest.mark.asyncio
 async def test_shutdown() -> None:
     backend = ClaudeCodeBackend()
-    mock_client = AsyncMock()
-    backend._clients[""] = mock_client
+    mock_client, entry = _mock_entry()
+    backend._entries[""] = entry
 
     await backend.shutdown()
     mock_client.disconnect.assert_called_once()
-    assert len(backend._clients) == 0
+    assert len(backend._entries) == 0
 
 
 @pytest.mark.asyncio

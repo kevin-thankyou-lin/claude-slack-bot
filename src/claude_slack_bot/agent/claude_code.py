@@ -25,12 +25,19 @@ async def _always_allow(
     return PermissionResultAllow()
 
 
+class _ClientEntry:
+    """A SDK client plus a lock to serialize concurrent access."""
+
+    def __init__(self, client: ClaudeSDKClient) -> None:
+        self.client = client
+        self.lock = asyncio.Lock()
+
+
 class ClaudeCodeBackend:
     """Agent backend using the Claude Code SDK with persistent subprocesses.
 
-    One SDK client is created per unique working directory.  Each Slack thread
-    maps to a ``session_id`` inside that client so multi-turn conversations
-    cost only incremental tokens — no history replay.
+    One SDK client per unique working directory. Access to each client is
+    serialized with a lock so concurrent threads don't interleave events.
     """
 
     def __init__(
@@ -45,22 +52,21 @@ class ClaudeCodeBackend:
         self.default_cwd = cwd
         self._auto_approve: set[str] = set()
 
-        # One SDK client per cwd (keyed by resolved path, "" = default)
-        self._clients: dict[str, ClaudeSDKClient] = {}
-        self._lock = asyncio.Lock()
+        self._entries: dict[str, _ClientEntry] = {}
+        self._create_lock = asyncio.Lock()
 
-        # session_id -> cwd key (so we know which client to use)
+        # session_id -> cwd key
         self._session_cwd: dict[str, str] = {}
 
-    async def _get_client(self, cwd: str = "") -> ClaudeSDKClient:
-        """Get or create an SDK client for the given working directory."""
+    async def _get_entry(self, cwd: str = "") -> _ClientEntry:
+        """Get or create a client entry for the given cwd."""
         key = cwd or ""
-        if key in self._clients:
-            return self._clients[key]
+        if key in self._entries:
+            return self._entries[key]
 
-        async with self._lock:
-            if key in self._clients:
-                return self._clients[key]
+        async with self._create_lock:
+            if key in self._entries:
+                return self._entries[key]
 
             opts = ClaudeCodeOptions(
                 model=self.model,
@@ -73,9 +79,10 @@ class ClaudeCodeBackend:
             )
             client = ClaudeSDKClient(opts)
             await client.connect()
-            self._clients[key] = client
+            entry = _ClientEntry(client)
+            self._entries[key] = entry
             logger.info("claude_code_backend.client_connected", model=self.model, cwd=cwd or "(default)")
-            return client
+            return entry
 
     async def create_session(self, system_prompt: str | None = None) -> str:
         session_id = uuid.uuid4().hex
@@ -83,7 +90,6 @@ class ClaudeCodeBackend:
         return session_id
 
     def set_session_cwd(self, session_id: str, cwd: str) -> None:
-        """Assign a working directory to a session (thread)."""
         self._session_cwd[session_id] = cwd
 
     def set_auto_approve(self, session_id: str, *, enabled: bool) -> None:
@@ -93,33 +99,32 @@ class ClaudeCodeBackend:
             self._auto_approve.discard(session_id)
 
     async def send_message(self, session_id: str, content: str) -> AsyncIterator[SessionEvent]:
-        """Send a message via the appropriate SDK client for this session's cwd."""
+        """Send a message. Serialized per-client so concurrent threads don't interleave."""
         try:
             cwd = self._session_cwd.get(session_id, "")
-            client = await self._get_client(cwd)
+            entry = await self._get_entry(cwd)
 
-            await client.query(content, session_id=session_id)
+            # Serialize: only one query per client at a time
+            async with entry.lock:
+                await entry.client.query(content, session_id=session_id)
 
-            async for msg in client.receive_response():
-                if isinstance(msg, StreamEvent):
-                    delta_text = self._extract_text_delta(msg)
-                    if delta_text:
-                        yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
-                elif isinstance(msg, ResultMessage):
-                    yield SessionEvent(type=EventType.TURN_END, is_final=True)
-                    return
-                # AssistantMessage and SystemMessage are skipped — with
-                # include_partial_messages=True, all text arrives via StreamEvent
-                # deltas. Emitting AssistantMessage text too causes duplicates.
+                async for msg in entry.client.receive_response():
+                    if isinstance(msg, StreamEvent):
+                        delta_text = self._extract_text_delta(msg)
+                        if delta_text:
+                            yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
+                    elif isinstance(msg, ResultMessage):
+                        yield SessionEvent(type=EventType.TURN_END, is_final=True)
+                        return
+                    # AssistantMessage/SystemMessage skipped — deltas cover text
 
-            yield SessionEvent(type=EventType.TURN_END, is_final=True)
+                yield SessionEvent(type=EventType.TURN_END, is_final=True)
 
         except Exception as e:
             logger.exception("claude_code_backend.send_error", session_id=session_id)
             yield SessionEvent(type=EventType.ERROR, error_message=str(e))
-            # Reset the specific client that failed
             cwd = self._session_cwd.get(session_id, "")
-            await self._reset_client(cwd)
+            await self._reset_entry(cwd)
 
     async def send_tool_result(self, session_id: str, tool_use_id: str, result: str) -> AsyncIterator[SessionEvent]:
         yield SessionEvent(type=EventType.TURN_END, is_final=True)
@@ -130,8 +135,8 @@ class ClaudeCodeBackend:
         yield SessionEvent(type=EventType.TURN_END, is_final=True)
 
     async def shutdown(self) -> None:
-        for cwd_key in list(self._clients.keys()):
-            await self._reset_client(cwd_key)
+        for key in list(self._entries.keys()):
+            await self._reset_entry(key)
 
     def _extract_text_delta(self, event: StreamEvent) -> str:
         evt = event.event
@@ -141,10 +146,10 @@ class ClaudeCodeBackend:
                 return delta.get("text", "")
         return ""
 
-    async def _reset_client(self, cwd_key: str = "") -> None:
-        client = self._clients.pop(cwd_key, None)
-        if client is not None:
+    async def _reset_entry(self, cwd_key: str = "") -> None:
+        entry = self._entries.pop(cwd_key, None)
+        if entry is not None:
             try:
-                await client.disconnect()
+                await entry.client.disconnect()
             except Exception:
                 logger.exception("claude_code_backend.disconnect_error", cwd=cwd_key)
