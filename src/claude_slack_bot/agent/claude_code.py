@@ -87,6 +87,13 @@ class ClaudeCodeBackend:
         else:
             self._auto_approve.discard(session_id)
 
+    def interrupt(self, session_id: str) -> None:
+        """Interrupt the running query for a session."""
+        client = self._clients.get(session_id)
+        if client:
+            client.interrupt()
+            logger.info("claude_code_backend.interrupted", session_id=session_id)
+
     async def send_message(self, session_id: str, content: str) -> AsyncIterator[SessionEvent]:
         """Send a message. Each session has its own client — fully parallel, no cross-talk."""
         try:

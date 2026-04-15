@@ -148,6 +148,11 @@ class ThreadCoordinator:
             await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say, user_id=user_id)
             return
 
+        # Handle stop/cancel command
+        if text.strip().lower() in ("stop", "cancel", "abort", "nevermind", "nvm"):
+            await self._handle_stop(thread_ts, say)
+            return
+
         if thread_ts in self._active and not self._active[thread_ts].done():
             logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
             await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
@@ -208,6 +213,24 @@ class ThreadCoordinator:
 
         await say(text=f":file_folder: Working directory set to `{resolved}`", thread_ts=thread_ts)
         logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
+
+    async def _handle_stop(self, thread_ts: str, say: Any) -> None:
+        """Cancel the running task for a thread."""
+        task = self._active.get(thread_ts)
+        if task and not task.done():
+            # Interrupt the Claude process
+            async with self.db._connect() as db:
+                thread = await queries.get_thread(db, thread_ts)
+            if thread and hasattr(self.backend, "interrupt"):
+                self.backend.interrupt(thread.session_id)
+
+            task.cancel()
+            self._active.pop(thread_ts, None)
+            self._stream_buffers.pop(thread_ts, None)
+            await say(text=":octagonal_sign: Stopped. Send a new message to continue.", thread_ts=thread_ts)
+            logger.info("coordinator.stopped", thread_ts=thread_ts)
+        else:
+            await say(text="Nothing running in this thread.", thread_ts=thread_ts)
 
     async def handle_tool_confirmation(
         self,
