@@ -36,23 +36,30 @@ def register_listeners(
 
     @app.event("message")
     async def handle_message(event: dict, say: object, client: object) -> None:  # type: ignore[type-arg]
-        """Handle messages in threads the bot is participating in."""
+        """Handle messages in threads and DMs."""
         # Ignore bot messages (including our own)
         if event.get("bot_id") or event.get("subtype"):
             return
 
-        # Only handle threaded replies (not top-level channel messages)
-        thread_ts = event.get("thread_ts")
-        if not thread_ts:
-            return
-
         text = event.get("text", "")
-        # Strip bot mentions from threaded replies too
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
         if not text:
             return
 
         channel_id = event.get("channel", "")
+        channel_type = event.get("channel_type", "")
+
+        # DMs: treat every message as a conversation (use ts as thread_ts for first message)
+        if channel_type == "im":
+            thread_ts = event.get("thread_ts", event.get("ts", ""))
+            logger.info("listener.dm", channel=channel_id, thread_ts=thread_ts)
+            await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
+            return
+
+        # Channels: only handle threaded replies
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return
 
         logger.info("listener.thread_reply", channel=channel_id, thread_ts=thread_ts)
         await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
