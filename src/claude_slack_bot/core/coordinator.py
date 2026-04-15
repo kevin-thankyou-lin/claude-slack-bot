@@ -20,6 +20,68 @@ logger = structlog.get_logger()
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
+STREAM_FLUSH_INTERVAL = 1.5  # seconds between Slack message updates
+
+
+class _StreamBuffer:
+    """Accumulates text deltas and flushes to a single Slack message."""
+
+    def __init__(self, thread_ts: str, say: Any, client: Any) -> None:
+        self.thread_ts = thread_ts
+        self._say = say
+        self._client = client
+        self._text = ""
+        self._slack_msg_ts: str | None = None
+        self._channel_id: str | None = None
+        self._dirty = False
+
+    async def append(self, delta: str) -> None:
+        self._text += delta
+        self._dirty = True
+        # Post first message immediately so user sees activity
+        if self._slack_msg_ts is None:
+            await self.flush()
+
+    async def flush(self) -> None:
+        if not self._dirty or not self._text:
+            return
+        self._dirty = False
+
+        if self._slack_msg_ts is None:
+            # First post
+            result = await self._say(text=self._text + " :writing_hand:", thread_ts=self.thread_ts)
+            if isinstance(result, dict):
+                self._slack_msg_ts = result.get("ts")
+                self._channel_id = result.get("channel")
+        elif self._channel_id:
+            # Update existing message
+            try:
+                await self._client.chat_update(
+                    channel=self._channel_id,
+                    ts=self._slack_msg_ts,
+                    text=self._text + " :writing_hand:",
+                )
+            except Exception:
+                logger.warning("stream_buffer.update_failed", thread_ts=self.thread_ts)
+
+    async def finalize(self) -> str:
+        """Final flush — remove typing indicator, return full text."""
+        if self._slack_msg_ts and self._channel_id and self._text:
+            try:
+                await self._client.chat_update(
+                    channel=self._channel_id,
+                    ts=self._slack_msg_ts,
+                    text=self._text,
+                )
+            except Exception:
+                logger.warning("stream_buffer.finalize_failed", thread_ts=self.thread_ts)
+        return self._text
+
+    @property
+    def has_content(self) -> bool:
+        return bool(self._text)
+
+
 class ThreadCoordinator:
     """Maps Slack threads to agent sessions and orchestrates the conversation loop."""
 
@@ -27,6 +89,7 @@ class ThreadCoordinator:
         self.backend = backend
         self.db = db
         self._active: dict[str, asyncio.Task[None]] = {}
+        self._stream_buffers: dict[str, _StreamBuffer] = {}
 
     async def handle_user_message(
         self,
@@ -112,8 +175,28 @@ class ThreadCoordinator:
             if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
                 self.backend.set_auto_approve(thread.session_id, enabled=True)
 
-            async for event in self.backend.send_message(thread.session_id, text):
-                await self._handle_event(event, thread_ts, thread.session_id, say, client)
+            # Create a stream buffer for live updates
+            buf = _StreamBuffer(thread_ts, say, client)
+            self._stream_buffers[thread_ts] = buf
+
+            # Periodic flush task
+            async def _periodic_flush() -> None:
+                while True:
+                    await asyncio.sleep(STREAM_FLUSH_INTERVAL)
+                    await buf.flush()
+
+            flush_task = asyncio.create_task(_periodic_flush())
+            try:
+                async for event in self.backend.send_message(thread.session_id, text):
+                    await self._handle_event(event, thread_ts, thread.session_id, say, client)
+            finally:
+                flush_task.cancel()
+                # Finalize the stream buffer (remove typing indicator)
+                if buf.has_content:
+                    final_text = await buf.finalize()
+                    async with self.db._connect() as db_conn:
+                        await queries.add_message(db_conn, thread_ts, "assistant", final_text)
+                self._stream_buffers.pop(thread_ts, None)
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)
@@ -129,8 +212,16 @@ class ThreadCoordinator:
         say: Any,
         client: Any,
     ) -> None:
-        if event.type == EventType.TEXT:
-            await self._handle_text(event, thread_ts, say)
+        if event.type == EventType.TEXT_DELTA:
+            buf = self._stream_buffers.get(thread_ts)
+            if buf:
+                await buf.append(event.text)
+            # If no buffer (non-streaming backend), fall through to TEXT handling
+        elif event.type == EventType.TEXT:
+            # If we have a stream buffer, the deltas already covered this text
+            buf = self._stream_buffers.get(thread_ts)
+            if not buf or not buf.has_content:
+                await self._handle_text(event, thread_ts, say)
         elif event.type == EventType.TOOL_CONFIRMATION_NEEDED:
             await self._handle_confirmation_needed(event, thread_ts, session_id, say, client)
         elif event.type == EventType.TOOL_USE:

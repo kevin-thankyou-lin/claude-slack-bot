@@ -12,7 +12,7 @@ from claude_code_sdk import (
     ResultMessage,
     SystemMessage,
 )
-from claude_code_sdk.types import TextBlock
+from claude_code_sdk.types import StreamEvent, TextBlock
 
 from .backend import EventType, SessionEvent
 from .prompts import SYSTEM_PROMPT
@@ -60,6 +60,7 @@ class ClaudeCodeBackend:
                 max_turns=self.max_turns,
                 append_system_prompt=SYSTEM_PROMPT,
                 permission_mode="bypassPermissions",
+                include_partial_messages=True,
             )
             client = ClaudeSDKClient(opts)
             await client.connect()
@@ -88,19 +89,21 @@ class ClaudeCodeBackend:
             await client.query(content, session_id=session_id)
 
             async for msg in client.receive_response():
-                if isinstance(msg, AssistantMessage):
+                if isinstance(msg, StreamEvent):
+                    # Streaming text delta — forward immediately for live updates
+                    delta_text = self._extract_text_delta(msg)
+                    if delta_text:
+                        yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
+                elif isinstance(msg, AssistantMessage):
+                    # Full assistant message — emit as TEXT for final state
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text:
                             yield SessionEvent(type=EventType.TEXT, text=block.text)
                 elif isinstance(msg, ResultMessage):
-                    # result may contain the final text if no AssistantMessage had it
-                    if msg.result and not any(isinstance(b, TextBlock) for b in (getattr(msg, "content", None) or [])):
-                        # Only yield if we haven't already yielded the text from AssistantMessage
-                        pass
                     yield SessionEvent(type=EventType.TURN_END, is_final=True)
                     return
                 elif isinstance(msg, SystemMessage):
-                    pass  # init messages, ignore
+                    pass
 
             # If we exit the loop without a ResultMessage
             yield SessionEvent(type=EventType.TURN_END, is_final=True)
@@ -124,6 +127,15 @@ class ClaudeCodeBackend:
     async def shutdown(self) -> None:
         """Disconnect the SDK client."""
         await self._reset_client()
+
+    def _extract_text_delta(self, event: StreamEvent) -> str:
+        """Extract text from a streaming delta event."""
+        evt = event.event
+        if evt.get("type") == "content_block_delta":
+            delta = evt.get("delta", {})
+            if delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        return ""
 
     async def _reset_client(self) -> None:
         if self._client is not None:
