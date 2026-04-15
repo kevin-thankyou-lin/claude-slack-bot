@@ -40,9 +40,11 @@ class ClaudeCodeBackend:
         *,
         model: str = "sonnet",
         max_turns: int = 30,
+        cwd: str | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
+        self.cwd = cwd
         self._auto_approve: set[str] = set()
         self._active_session: str | None = None
 
@@ -65,6 +67,7 @@ class ClaudeCodeBackend:
                 permission_mode="bypassPermissions",
                 can_use_tool=_always_allow,
                 include_partial_messages=True,
+                cwd=self.cwd,
             )
             client = ClaudeSDKClient(opts)
             await client.connect()

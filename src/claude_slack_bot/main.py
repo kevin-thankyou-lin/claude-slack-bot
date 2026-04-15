@@ -19,7 +19,7 @@ logger = structlog.get_logger()
 def _create_backend(settings: Settings) -> ClaudeCodeBackend:
     """Create the appropriate agent backend based on config."""
     if settings.default_backend == "claude-code":
-        return ClaudeCodeBackend(model=settings.default_model)
+        return ClaudeCodeBackend(model=settings.default_model, cwd=settings.cwd or None)
 
     if settings.default_backend == "managed":
         import anthropic

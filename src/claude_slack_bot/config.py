@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     image_api_url: str = ""
     image_api_key: str = ""
 
+    # Claude Code working directory (where sessions run)
+    cwd: str = ""  # e.g. "/home/linke/Projects/my-repo" — defaults to bot's cwd if empty
+
     # Behaviour
     default_backend: str = "claude-code"  # "claude-code", "messages", or "managed"
     max_turns_per_thread: int = 200
