@@ -20,14 +20,16 @@ def register_listeners(
 
     @app.event("app_mention")
     async def handle_app_mention(event: dict, say: object, client: object) -> None:  # type: ignore[type-arg]
-        """Handle @bot mentions — starts or continues a thread."""
+        """Handle @bot mentions in channels (not DMs — those are handled by message handler)."""
+        # Skip DMs — the message handler already covers them
+        if event.get("channel_type") == "im":
+            return
+
         text = event.get("text", "")
-        # Strip the bot mention from the text
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
         if not text:
             text = "Hello!"
 
-        # Use thread_ts if this is a reply, otherwise use ts to start a new thread
         thread_ts = event.get("thread_ts", event.get("ts", ""))
         channel_id = event.get("channel", "")
 
