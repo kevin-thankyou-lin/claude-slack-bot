@@ -33,6 +33,15 @@ python -m claude_slack_bot.main
 
 ### 1. Create a Slack App
 
+**Option A — Import manifest (recommended):**
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
+2. Choose **From an app manifest**
+3. Select your workspace
+4. Paste the contents of `manifest.json` from this repo
+5. Click **Create** — all scopes, events, and settings are pre-configured
+6. Skip to step 6 (Install the App)
+
+**Option B — Manual setup:**
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
 2. Choose **From scratch**
 3. Name it (e.g., "Claude Bot") and select your workspace

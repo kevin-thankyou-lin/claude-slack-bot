@@ -51,18 +51,12 @@ def register_listeners(
         channel_id = event.get("channel", "")
         channel_type = event.get("channel_type", "")
 
-        # DMs: all messages share one session (keyed by channel_id),
-        # bot replies in a thread under each user message
+        # DMs: each message starts a thread (same model as channels)
+        # User replies in-thread continue the session
         if channel_type == "im":
-            msg_ts = event.get("ts", "")
-            # If user is replying in a thread, use that thread
-            reply_thread_ts = event.get("thread_ts", msg_ts)
-            # Session key = channel_id so all DM messages share context
-            session_key = f"dm:{channel_id}"
-            logger.info("listener.dm", channel=channel_id, reply_to=reply_thread_ts)
-            await coordinator.handle_user_message(
-                session_key, channel_id, text, say, client, reply_thread_ts=reply_thread_ts
-            )
+            thread_ts = event.get("thread_ts", event.get("ts", ""))
+            logger.info("listener.dm", channel=channel_id, thread_ts=thread_ts)
+            await coordinator.handle_user_message(thread_ts, channel_id, text, say, client)
             return
 
         # Channels: only handle threaded replies
