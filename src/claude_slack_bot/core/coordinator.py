@@ -277,7 +277,7 @@ class ThreadCoordinator:
             flush_task = asyncio.create_task(_periodic_flush())
             try:
                 async for event in self.backend.send_message(btw_session, text):
-                    await self._handle_event(event, buf_key, btw_session, say, client)
+                    await self._handle_event(event, buf_key, btw_session, user_id, say, client)
             finally:
                 flush_task.cancel()
                 if buf.has_content:
