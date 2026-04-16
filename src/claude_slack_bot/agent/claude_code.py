@@ -22,8 +22,15 @@ logger = structlog.get_logger()
 # This is more reliable than can_use_tool callback which has a bug
 # where it stops being invoked after the first client in a process.
 ALL_TOOLS = [
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-    "WebFetch", "WebSearch", "NotebookEdit",
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "NotebookEdit",
 ]
 
 

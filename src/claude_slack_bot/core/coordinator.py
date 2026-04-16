@@ -133,6 +133,7 @@ class ThreadCoordinator:
         self._active: dict[str, asyncio.Task[None]] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}
         self._polls: dict[str, asyncio.Task[None]] = {}  # thread_ts -> poll task
+        self._queues: dict[str, asyncio.Queue[tuple[str, str, str, Any, Any, str]]] = {}  # thread_ts -> message queue
 
     async def handle_user_message(
         self,
@@ -191,11 +192,15 @@ class ThreadCoordinator:
             return
 
         if thread_ts in self._active and not self._active[thread_ts].done():
-            logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
-            await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
+            # Queue the message instead of dropping it
+            if thread_ts not in self._queues:
+                self._queues[thread_ts] = asyncio.Queue()
+            await self._queues[thread_ts].put((thread_ts, channel_id, text, say, client, user_id))
+            logger.info("coordinator.queued", thread_ts=thread_ts, text=text[:50])
+            await say(text=":inbox_tray: Queued — will process after current task finishes.", thread_ts=thread_ts)
             return
 
-        task = asyncio.create_task(self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id))
+        task = asyncio.create_task(self._process_and_drain(thread_ts, channel_id, text, say, client, user_id))
         self._active[thread_ts] = task
 
     def _resolve_cwd(self, path: str) -> Path | None:
@@ -497,6 +502,25 @@ class ThreadCoordinator:
             await self._handle_event(event, thread_ts, thread.session_id, user_id, say, client)
 
     # ── internals ────────────────────────────────────────────────────────────
+
+    async def _process_and_drain(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        text: str,
+        say: Any,
+        client: Any,
+        user_id: str = "",
+    ) -> None:
+        """Process a message, then drain any queued messages for this thread."""
+        await self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id)
+
+        # Drain queued messages
+        queue = self._queues.get(thread_ts)
+        while queue and not queue.empty():
+            q_thread_ts, q_channel_id, q_text, q_say, q_client, q_user_id = await queue.get()
+            logger.info("coordinator.drain_queued", thread_ts=q_thread_ts, text=q_text[:50])
+            await self._process_message(q_thread_ts, q_channel_id, q_text, q_say, q_client, user_id=q_user_id)
 
     async def _process_message(
         self,
