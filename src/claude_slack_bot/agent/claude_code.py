@@ -86,6 +86,7 @@ class ClaudeCodeBackend:
                 include_partial_messages=True,
                 cwd=cwd,
                 resume=resume,
+                extra_args={"--dangerously-skip-permissions": None},
             )
 
         client = ClaudeSDKClient(_make_opts(cc_session_id))
