@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +154,13 @@ class ThreadCoordinator:
             await self._handle_stop(thread_ts, say)
             return
 
+        # Handle btw (side-channel question — runs in parallel, doesn't block the main task)
+        btw_match = re.match(r"^btw[:\s]+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
+        if btw_match:
+            btw_text = btw_match.group(1).strip()
+            _btw_task = asyncio.create_task(self._process_btw(thread_ts, channel_id, btw_text, say, client, user_id))  # noqa: RUF006
+            return
+
         if thread_ts in self._active and not self._active[thread_ts].done():
             logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
             await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
@@ -231,6 +239,58 @@ class ThreadCoordinator:
             logger.info("coordinator.stopped", thread_ts=thread_ts)
         else:
             await say(text="Nothing running in this thread.", thread_ts=thread_ts)
+
+    async def _process_btw(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        text: str,
+        say: Any,
+        client: Any,
+        user_id: str = "",
+    ) -> None:
+        """Process a side-channel 'btw' question on a temporary session."""
+        btw_session = f"btw-{uuid.uuid4().hex}"
+        try:
+            # Copy the thread's cwd to the temp session
+            async with self.db._connect() as db:
+                thread = await queries.get_thread(db, thread_ts)
+            if thread and thread.cwd and hasattr(self.backend, "set_session_cwd"):
+                await self.backend.set_session_cwd(btw_session, thread.cwd)
+
+            # Post thinking indicator
+            thinking_result = await say(text=":speech_balloon: btw — thinking...", thread_ts=thread_ts)
+            thinking_ts = thinking_result.get("ts") if isinstance(thinking_result, dict) else None
+            thinking_channel = thinking_result.get("channel") if isinstance(thinking_result, dict) else None
+
+            buf_key = f"btw:{thread_ts}:{btw_session}"
+            buf = _StreamBuffer(thread_ts, say, client, user_id=user_id)
+            buf._thinking_ts = thinking_ts
+            buf._thinking_channel = thinking_channel
+            self._stream_buffers[buf_key] = buf
+
+            async def _periodic_flush() -> None:
+                while True:
+                    await asyncio.sleep(STREAM_FLUSH_INTERVAL)
+                    await buf.flush()
+
+            flush_task = asyncio.create_task(_periodic_flush())
+            try:
+                async for event in self.backend.send_message(btw_session, text):
+                    await self._handle_event(event, buf_key, btw_session, say, client)
+            finally:
+                flush_task.cancel()
+                if buf.has_content:
+                    await buf.finalize()
+                self._stream_buffers.pop(buf_key, None)
+
+            # Clean up the temporary session
+            if hasattr(self.backend, "_reset_client"):
+                await self.backend._reset_client(btw_session)
+
+        except Exception:
+            logger.exception("coordinator.btw_error", thread_ts=thread_ts)
+            await say(text=":warning: btw question failed.", thread_ts=thread_ts)
 
     async def handle_tool_confirmation(
         self,
