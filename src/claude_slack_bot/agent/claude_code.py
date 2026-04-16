@@ -43,7 +43,7 @@ class ClaudeCodeBackend:
         self,
         *,
         model: str = "sonnet",
-        max_turns: int = 30,
+        max_turns: int = 15,
         cwd: str | None = None,
     ) -> None:
         self.model = model

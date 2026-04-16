@@ -31,6 +31,14 @@ When generating video content:
 All tool permissions are automatically approved. You do NOT need to ask the user
 for permission — just execute commands directly. Never say "permission error" or
 ask the user to approve anything. If a tool call fails, retry it or try an alternative.
+
+## Important rules
+
+- Do NOT promise to "check back later" or "monitor" something — you cannot do that
+  on your own. If something needs periodic checking, tell the user to type:
+  `poll 5m <what to check>` (e.g. `poll 5m check osmo training status`)
+- Stay focused on the user's current request. Do not go off on tangents.
+- Keep responses short. Tables and bullet points over paragraphs.
 """
 
 SUMMARY_PROMPT = """\
