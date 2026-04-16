@@ -363,7 +363,16 @@ class ThreadCoordinator:
         client: Any,
         user_id: str,
     ) -> None:
-        """Run a prompt on a recurring interval in a thread."""
+        """Run a prompt on a recurring interval, letting Claude decide what to do each tick."""
+        poll_prompt = (
+            f"{prompt}\n\n"
+            "---\n"
+            "_This is an automated periodic check. Based on the results:_\n"
+            "- _If still in progress and looks healthy, give a brief status update._\n"
+            "- _If something needs fixing, go ahead and fix it._\n"
+            "- _If the task is complete or no longer needs monitoring, "
+            "include POLL_COMPLETE in your response to stop this recurring check._\n"
+        )
         try:
             while True:
                 await asyncio.sleep(interval_secs)
@@ -375,9 +384,25 @@ class ThreadCoordinator:
 
                 logger.info("coordinator.poll_tick", thread_ts=thread_ts, prompt=prompt)
                 task = asyncio.create_task(
-                    self._process_message(thread_ts, channel_id, prompt, say, client, user_id=user_id)
+                    self._process_message(thread_ts, channel_id, poll_prompt, say, client, user_id=user_id)
                 )
                 self._active[thread_ts] = task
+
+                # Wait for this tick to finish so we can check the response
+                await task
+
+                # Check if Claude signalled completion via the stream buffer's final text
+                # The finalized text was stored in the DB — read the latest assistant message
+                async with self.db._connect() as db:
+                    messages = await queries.get_messages(db, thread_ts)
+                if messages:
+                    last_msg = messages[-1]
+                    if last_msg.role == "assistant" and "POLL_COMPLETE" in last_msg.content:
+                        logger.info("coordinator.poll_auto_stopped", thread_ts=thread_ts)
+                        self._polls.pop(thread_ts, None)
+                        await say(text=":white_check_mark: Poll auto-stopped (task complete).", thread_ts=thread_ts)
+                        return
+
         except asyncio.CancelledError:
             logger.info("coordinator.poll_cancelled", thread_ts=thread_ts)
 
