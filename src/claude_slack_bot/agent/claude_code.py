@@ -36,7 +36,7 @@ class ClaudeCodeBackend:
     so sessions can be resumed after a bot restart.
     """
 
-    IDLE_TIMEOUT = 600  # disconnect clients idle for 10 minutes
+    IDLE_TIMEOUT = 43200  # disconnect clients idle for 12 hours
 
     def __init__(
         self,

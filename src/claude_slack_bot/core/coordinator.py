@@ -154,6 +154,11 @@ class ThreadCoordinator:
             await self._handle_stop(thread_ts, say)
             return
 
+        # Handle done — stop task and disconnect the client to free resources
+        if text.strip().lower() == "done":
+            await self._handle_done(thread_ts, say)
+            return
+
         # Handle btw (side-channel question — runs in parallel, doesn't block the main task)
         btw_match = re.match(r"^btw[:\s]+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
         if btw_match:
@@ -239,6 +244,28 @@ class ThreadCoordinator:
             logger.info("coordinator.stopped", thread_ts=thread_ts)
         else:
             await say(text="Nothing running in this thread.", thread_ts=thread_ts)
+
+    async def _handle_done(self, thread_ts: str, say: Any) -> None:
+        """Mark thread as done — stop any running task and disconnect the client."""
+        # Stop running task if any
+        task = self._active.get(thread_ts)
+        if task and not task.done():
+            async with self.db._connect() as db:
+                thread = await queries.get_thread(db, thread_ts)
+            if thread and hasattr(self.backend, "interrupt"):
+                await self.backend.interrupt(thread.session_id)
+            task.cancel()
+            self._active.pop(thread_ts, None)
+            self._stream_buffers.pop(thread_ts, None)
+
+        # Disconnect the client to free resources
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+        if thread and hasattr(self.backend, "_reset_client"):
+            await self.backend._reset_client(thread.session_id)
+
+        await say(text=":white_check_mark: Done. Thread closed. Start a new message for a fresh conversation.", thread_ts=thread_ts)
+        logger.info("coordinator.done", thread_ts=thread_ts)
 
     async def _process_btw(
         self,
