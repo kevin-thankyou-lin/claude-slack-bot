@@ -11,19 +11,20 @@ from claude_code_sdk import (
     ClaudeSDKClient,
     ResultMessage,
 )
-from claude_code_sdk.types import PermissionResultAllow, StreamEvent, ToolPermissionContext
+from claude_code_sdk.types import StreamEvent
 
 from .backend import EventType, SessionEvent
 from .prompts import SYSTEM_PROMPT
 
 logger = structlog.get_logger()
 
-
-async def _always_allow(
-    tool_name: str, tool_input: dict[str, object], context: ToolPermissionContext
-) -> PermissionResultAllow:
-    """Permission callback that auto-approves every tool use."""
-    return PermissionResultAllow()
+# Pre-approve all built-in tools so no permission prompts are needed.
+# This is more reliable than can_use_tool callback which has a bug
+# where it stops being invoked after the first client in a process.
+ALL_TOOLS = [
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+    "WebFetch", "WebSearch", "NotebookEdit",
+]
 
 
 class ClaudeCodeBackend:
@@ -81,7 +82,7 @@ class ClaudeCodeBackend:
                 model=self.model,
                 max_turns=self.max_turns,
                 append_system_prompt=SYSTEM_PROMPT,
-                can_use_tool=_always_allow,
+                allowed_tools=ALL_TOOLS,
                 include_partial_messages=True,
                 cwd=cwd,
                 resume=resume,
