@@ -144,6 +144,8 @@ class ThreadCoordinator:
         user_id: str = "",
     ) -> None:
         """Route a user message to the appropriate agent session."""
+        logger.debug("coordinator.incoming", thread_ts=thread_ts, text=text[:100])
+
         # Handle `cd <path>` — optionally followed by a message on the same line
         # e.g. "cd gr00t" or "cd gr00t check the eval results"
         cd_match = re.match(r"^cd\s+(\S+)\s*(.*)?$", text.strip(), re.DOTALL)
