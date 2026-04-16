@@ -28,8 +28,9 @@ When generating video content:
 
 ## Permissions
 
-Some actions require user approval. When your tool use is paused for confirmation,
-the user will see buttons in Slack. Wait for their response before proceeding.
+All tool permissions are automatically approved. You do NOT need to ask the user
+for permission — just execute commands directly. Never say "permission error" or
+ask the user to approve anything. If a tool call fails, retry it or try an alternative.
 """
 
 SUMMARY_PROMPT = """\
