@@ -16,9 +16,10 @@ def _make_stream_delta(text: str) -> MagicMock:
     return msg
 
 
-def _make_result_msg(result: str | None = None) -> MagicMock:
+def _make_result_msg(result: str | None = None, session_id: str = "cc-test-123") -> MagicMock:
     msg = MagicMock(spec=ResultMessage)
     msg.result = result
+    msg.session_id = session_id
     return msg
 
 

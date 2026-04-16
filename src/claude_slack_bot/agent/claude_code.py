@@ -29,6 +29,9 @@ class ClaudeCodeBackend:
 
     One SDK client per Slack thread. Each thread gets its own ``claude``
     process so conversations run fully in parallel with no cross-talk.
+
+    Claude Code session IDs are captured from ResultMessage and stored
+    so sessions can be resumed after a bot restart.
     """
 
     def __init__(
@@ -47,6 +50,8 @@ class ClaudeCodeBackend:
         self._clients: dict[str, ClaudeSDKClient] = {}
         # session_id -> cwd
         self._session_cwd: dict[str, str] = {}
+        # session_id -> Claude Code's own session UUID (for resume)
+        self._cc_session_ids: dict[str, str] = {}
 
     async def _get_client(self, session_id: str) -> ClaudeSDKClient:
         """Get or create an SDK client for this session."""
@@ -54,6 +59,8 @@ class ClaudeCodeBackend:
             return self._clients[session_id]
 
         cwd = self._session_cwd.get(session_id) or self.default_cwd
+        cc_session_id = self._cc_session_ids.get(session_id)
+
         opts = ClaudeCodeOptions(
             model=self.model,
             max_turns=self.max_turns,
@@ -62,11 +69,17 @@ class ClaudeCodeBackend:
             can_use_tool=_always_allow,
             include_partial_messages=True,
             cwd=cwd,
+            resume=cc_session_id,
         )
         client = ClaudeSDKClient(opts)
         await client.connect()
         self._clients[session_id] = client
-        logger.info("claude_code_backend.client_connected", session_id=session_id, cwd=cwd or "(default)")
+        logger.info(
+            "claude_code_backend.client_connected",
+            session_id=session_id,
+            cwd=cwd or "(default)",
+            resume=cc_session_id or "(new)",
+        )
         return client
 
     async def create_session(self, system_prompt: str | None = None) -> str:
@@ -74,10 +87,17 @@ class ClaudeCodeBackend:
         logger.info("claude_code_backend.session_created", session_id=session_id)
         return session_id
 
+    def set_cc_session_id(self, session_id: str, cc_session_id: str) -> None:
+        """Set the Claude Code session UUID for resume support."""
+        self._cc_session_ids[session_id] = cc_session_id
+
+    def get_cc_session_id(self, session_id: str) -> str:
+        """Get the Claude Code session UUID if known."""
+        return self._cc_session_ids.get(session_id, "")
+
     async def set_session_cwd(self, session_id: str, cwd: str) -> None:
         old_cwd = self._session_cwd.get(session_id)
         self._session_cwd[session_id] = cwd
-        # Only reset client if cwd actually changed
         if old_cwd != cwd and session_id in self._clients:
             await self._reset_client(session_id)
 
@@ -107,6 +127,9 @@ class ClaudeCodeBackend:
                     if delta_text:
                         yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
                 elif isinstance(msg, ResultMessage):
+                    # Capture the Claude Code session UUID for resume
+                    if msg.session_id:
+                        self._cc_session_ids[session_id] = msg.session_id
                     yield SessionEvent(type=EventType.TURN_END, is_final=True)
                     return
 

@@ -373,6 +373,9 @@ class ThreadCoordinator:
                 self.backend.set_auto_approve(thread.session_id, enabled=True)
             if thread.cwd and hasattr(self.backend, "set_session_cwd"):
                 await self.backend.set_session_cwd(thread.session_id, thread.cwd)
+            # Restore Claude Code session ID for resume after restart
+            if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
+                self.backend.set_cc_session_id(thread.session_id, thread.cc_session_id)
 
             message = text
 
@@ -403,6 +406,14 @@ class ThreadCoordinator:
                     async with self.db._connect() as db_conn:
                         await queries.add_message(db_conn, thread_ts, "assistant", final_text)
                 self._stream_buffers.pop(thread_ts, None)
+
+                # Persist the Claude Code session ID for resume after restart
+                if hasattr(self.backend, "get_cc_session_id"):
+                    cc_sid = self.backend.get_cc_session_id(thread.session_id)
+                    if cc_sid and cc_sid != thread.cc_session_id:
+                        thread.cc_session_id = cc_sid
+                        async with self.db._connect() as db_conn:
+                            await queries.upsert_thread(db_conn, thread)
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)

@@ -12,6 +12,7 @@ class Thread:
     backend_type: str = "messages"
     auto_approve: bool = False
     cwd: str = ""
+    cc_session_id: str = ""
     status: str = "active"
     user_id: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
