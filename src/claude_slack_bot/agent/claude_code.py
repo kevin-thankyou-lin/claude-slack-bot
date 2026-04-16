@@ -81,7 +81,6 @@ class ClaudeCodeBackend:
                 model=self.model,
                 max_turns=self.max_turns,
                 append_system_prompt=SYSTEM_PROMPT,
-                permission_mode="acceptEdits",
                 can_use_tool=_always_allow,
                 include_partial_messages=True,
                 cwd=cwd,
