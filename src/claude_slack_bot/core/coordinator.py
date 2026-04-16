@@ -132,6 +132,7 @@ class ThreadCoordinator:
         self.projects_dir = Path(projects_dir)
         self._active: dict[str, asyncio.Task[None]] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}
+        self._polls: dict[str, asyncio.Task[None]] = {}  # thread_ts -> poll task
 
     async def handle_user_message(
         self,
@@ -154,7 +155,9 @@ class ThreadCoordinator:
                 # Process the rest as a normal message
                 if thread_ts in self._active and not self._active[thread_ts].done():
                     logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
-                    await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
+                    await say(
+                        text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts
+                    )
                 else:
                     task = asyncio.create_task(
                         self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
@@ -162,7 +165,13 @@ class ThreadCoordinator:
                     self._active[thread_ts] = task
             return
 
-        # Handle stop/cancel command
+        # Handle poll command: "poll 10m check status" or "poll stop"
+        poll_match = re.match(r"^poll\s+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
+        if poll_match:
+            await self._handle_poll(thread_ts, channel_id, poll_match.group(1).strip(), say, client, user_id)
+            return
+
+        # Handle stop/cancel command (also stops polls)
         if text.strip().lower() in ("stop", "cancel", "abort", "nevermind", "nvm"):
             await self._handle_stop(thread_ts, say)
             return
@@ -241,7 +250,12 @@ class ThreadCoordinator:
         logger.info("coordinator.cwd_set", thread_ts=thread_ts, cwd=str(resolved))
 
     async def _handle_stop(self, thread_ts: str, say: Any) -> None:
-        """Cancel the running task for a thread."""
+        """Cancel the running task and any poll for a thread."""
+        # Cancel poll if active
+        poll_task = self._polls.pop(thread_ts, None)
+        if poll_task:
+            poll_task.cancel()
+
         task = self._active.get(thread_ts)
         if task and not task.done():
             # Interrupt the Claude process
@@ -259,7 +273,12 @@ class ThreadCoordinator:
             await say(text="Nothing running in this thread.", thread_ts=thread_ts)
 
     async def _handle_done(self, thread_ts: str, say: Any) -> None:
-        """Mark thread as done — stop any running task and disconnect the client."""
+        """Mark thread as done — stop any running task, poll, and disconnect the client."""
+        # Cancel poll if active
+        poll_task = self._polls.pop(thread_ts, None)
+        if poll_task:
+            poll_task.cancel()
+
         # Stop running task if any
         task = self._active.get(thread_ts)
         if task and not task.done():
@@ -277,8 +296,90 @@ class ThreadCoordinator:
         if thread and hasattr(self.backend, "_reset_client"):
             await self.backend._reset_client(thread.session_id)
 
-        await say(text=":white_check_mark: Done. Thread closed. Start a new message for a fresh conversation.", thread_ts=thread_ts)
+        await say(
+            text=":white_check_mark: Done. Thread closed. Start a new message for a fresh conversation.",
+            thread_ts=thread_ts,
+        )
         logger.info("coordinator.done", thread_ts=thread_ts)
+
+    async def _handle_poll(
+        self, thread_ts: str, channel_id: str, args: str, say: Any, client: Any, user_id: str
+    ) -> None:
+        """Start or stop a recurring poll in this thread."""
+        if args.strip().lower() == "stop":
+            poll_task = self._polls.pop(thread_ts, None)
+            if poll_task:
+                poll_task.cancel()
+                await say(text=":octagonal_sign: Poll stopped.", thread_ts=thread_ts)
+            else:
+                await say(text="No active poll in this thread.", thread_ts=thread_ts)
+            return
+
+        # Parse: "poll 10m check osmo status" or "poll 1h check status"
+        interval_match = re.match(r"^(\d+)\s*(m|min|h|hr|s|sec)\s+(.+)$", args.strip(), re.IGNORECASE | re.DOTALL)
+        if not interval_match:
+            await say(
+                text="Usage: `poll <interval> <prompt>`\nExamples: `poll 10m check osmo status`, `poll 1h check eval results`, `poll stop`",
+                thread_ts=thread_ts,
+            )
+            return
+
+        amount = int(interval_match.group(1))
+        unit = interval_match.group(2).lower()
+        prompt = interval_match.group(3).strip()
+
+        if unit in ("m", "min"):
+            interval_secs = amount * 60
+        elif unit in ("h", "hr"):
+            interval_secs = amount * 3600
+        else:
+            interval_secs = amount
+
+        # Cancel existing poll if any
+        old_poll = self._polls.pop(thread_ts, None)
+        if old_poll:
+            old_poll.cancel()
+
+        # Start the poll
+        poll_task = asyncio.create_task(
+            self._run_poll(thread_ts, channel_id, prompt, interval_secs, say, client, user_id)
+        )
+        self._polls[thread_ts] = poll_task
+
+        unit_label = f"{amount}{'m' if unit in ('m', 'min') else unit[0]}"
+        await say(
+            text=f":repeat: Poll started — will run `{prompt}` every {unit_label}. Type `poll stop` to cancel.",
+            thread_ts=thread_ts,
+        )
+        logger.info("coordinator.poll_started", thread_ts=thread_ts, interval=interval_secs, prompt=prompt)
+
+    async def _run_poll(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        prompt: str,
+        interval_secs: int,
+        say: Any,
+        client: Any,
+        user_id: str,
+    ) -> None:
+        """Run a prompt on a recurring interval in a thread."""
+        try:
+            while True:
+                await asyncio.sleep(interval_secs)
+                # Wait for any active task to finish first
+                active = self._active.get(thread_ts)
+                if active and not active.done():
+                    logger.info("coordinator.poll_skipped_busy", thread_ts=thread_ts)
+                    continue
+
+                logger.info("coordinator.poll_tick", thread_ts=thread_ts, prompt=prompt)
+                task = asyncio.create_task(
+                    self._process_message(thread_ts, channel_id, prompt, say, client, user_id=user_id)
+                )
+                self._active[thread_ts] = task
+        except asyncio.CancelledError:
+            logger.info("coordinator.poll_cancelled", thread_ts=thread_ts)
 
     async def _process_btw(
         self,
