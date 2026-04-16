@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from typing import AsyncIterator
 
@@ -34,6 +36,8 @@ class ClaudeCodeBackend:
     so sessions can be resumed after a bot restart.
     """
 
+    IDLE_TIMEOUT = 600  # disconnect clients idle for 10 minutes
+
     def __init__(
         self,
         *,
@@ -52,6 +56,10 @@ class ClaudeCodeBackend:
         self._session_cwd: dict[str, str] = {}
         # session_id -> Claude Code's own session UUID (for resume)
         self._cc_session_ids: dict[str, str] = {}
+        # session_id -> last activity timestamp
+        self._last_active: dict[str, float] = {}
+        # Background cleanup task
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def _get_client(self, session_id: str) -> ClaudeSDKClient:
         """Get or create an SDK client for this session."""
@@ -61,19 +69,42 @@ class ClaudeCodeBackend:
         cwd = self._session_cwd.get(session_id) or self.default_cwd
         cc_session_id = self._cc_session_ids.get(session_id)
 
-        opts = ClaudeCodeOptions(
-            model=self.model,
-            max_turns=self.max_turns,
-            append_system_prompt=SYSTEM_PROMPT,
-            permission_mode="bypassPermissions",
-            can_use_tool=_always_allow,
-            include_partial_messages=True,
-            cwd=cwd,
-            resume=cc_session_id,
-        )
-        client = ClaudeSDKClient(opts)
-        await client.connect()
+        client = await self._connect_client(session_id, cwd, cc_session_id)
         self._clients[session_id] = client
+        return client
+
+    async def _connect_client(self, session_id: str, cwd: str | None, cc_session_id: str | None) -> ClaudeSDKClient:
+        """Connect an SDK client, falling back to a fresh session if resume fails."""
+
+        def _make_opts(resume: str | None) -> ClaudeCodeOptions:
+            return ClaudeCodeOptions(
+                model=self.model,
+                max_turns=self.max_turns,
+                append_system_prompt=SYSTEM_PROMPT,
+                permission_mode="bypassPermissions",
+                can_use_tool=_always_allow,
+                include_partial_messages=True,
+                cwd=cwd,
+                resume=resume,
+            )
+
+        client = ClaudeSDKClient(_make_opts(cc_session_id))
+        try:
+            await client.connect()
+        except Exception:
+            if cc_session_id:
+                logger.warning(
+                    "claude_code_backend.resume_failed_retrying_fresh",
+                    session_id=session_id,
+                    cc_session_id=cc_session_id,
+                )
+                self._cc_session_ids.pop(session_id, None)
+                client = ClaudeSDKClient(_make_opts(None))
+                await client.connect()
+                cc_session_id = None
+            else:
+                raise
+
         logger.info(
             "claude_code_backend.client_connected",
             session_id=session_id,
@@ -114,8 +145,29 @@ class ClaudeCodeBackend:
             client.interrupt()
             logger.info("claude_code_backend.interrupted", session_id=session_id)
 
+    def _start_cleanup_loop(self) -> None:
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_idle_clients())
+
+    async def _cleanup_idle_clients(self) -> None:
+        """Periodically disconnect clients that have been idle too long."""
+        while True:
+            await asyncio.sleep(60)
+            now = time.monotonic()
+            to_remove = [
+                sid
+                for sid, last in self._last_active.items()
+                if now - last > self.IDLE_TIMEOUT and sid in self._clients
+            ]
+            for sid in to_remove:
+                logger.info("claude_code_backend.idle_cleanup", session_id=sid)
+                await self._reset_client(sid)
+                self._last_active.pop(sid, None)
+
     async def send_message(self, session_id: str, content: str) -> AsyncIterator[SessionEvent]:
         """Send a message. Each session has its own client — fully parallel, no cross-talk."""
+        self._start_cleanup_loop()
+        self._last_active[session_id] = time.monotonic()
         try:
             client = await self._get_client(session_id)
 
