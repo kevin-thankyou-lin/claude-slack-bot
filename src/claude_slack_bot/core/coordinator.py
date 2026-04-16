@@ -143,10 +143,23 @@ class ThreadCoordinator:
         user_id: str = "",
     ) -> None:
         """Route a user message to the appropriate agent session."""
-        # Handle `cd /path` command
-        cd_match = re.match(r"^cd\s+(.+)$", text.strip())
+        # Handle `cd <path>` — optionally followed by a message on the same line
+        # e.g. "cd gr00t" or "cd gr00t check the eval results"
+        cd_match = re.match(r"^cd\s+(\S+)\s*(.*)?$", text.strip(), re.DOTALL)
         if cd_match:
-            await self._handle_cd(thread_ts, channel_id, cd_match.group(1).strip(), say, user_id=user_id)
+            cd_path = cd_match.group(1).strip()
+            remaining = (cd_match.group(2) or "").strip()
+            await self._handle_cd(thread_ts, channel_id, cd_path, say, user_id=user_id)
+            if remaining:
+                # Process the rest as a normal message
+                if thread_ts in self._active and not self._active[thread_ts].done():
+                    logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
+                    await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
+                else:
+                    task = asyncio.create_task(
+                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
+                    )
+                    self._active[thread_ts] = task
             return
 
         # Handle stop/cancel command
