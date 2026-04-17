@@ -722,6 +722,18 @@ class ThreadCoordinator:
         if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
             self.backend.set_cc_session_id(thread.session_id, thread.cc_session_id)
 
+    _AUTO_CONTINUE_PATTERNS = re.compile(
+        r"(?:proceed(?:ing)?|continu(?:ing|e)|starting (?:next|now)|moving on|on to)"
+        r"(?:\s+(?:unless|with|to|next)|\s*[.…]|\s*$)",
+        re.IGNORECASE,
+    )
+
+    def _should_auto_continue(self, text: str) -> bool:
+        """Check if Claude's response signals it wants to keep going."""
+        # Only check the last ~200 chars (the tail of the response)
+        tail = text[-200:]
+        return bool(self._AUTO_CONTINUE_PATTERNS.search(tail))
+
     def _extract_poll_request(self, buf: _StreamBuffer) -> tuple[int, str, str] | None:
         """Find and strip a POLL_START sentinel from the buffer. Returns (amount, unit, prompt)."""
         match = POLL_START_RE.search(buf._text)
@@ -845,6 +857,14 @@ class ThreadCoordinator:
                 amount, unit, prompt = poll_request
                 await self._start_poll_task(
                     thread_ts, channel_id, prompt, amount, unit, say, client, effective_user_id
+                )
+
+            # Auto-continue: if Claude's response signals it wants to keep going,
+            # send "continue" to kick off the next turn automatically
+            if buf.has_content and self._should_auto_continue(buf._text):
+                logger.info("coordinator.auto_continue", thread_ts=thread_ts)
+                await self._process_message(
+                    thread_ts, channel_id, "continue", say, client, user_id=effective_user_id
                 )
 
         except Exception:
