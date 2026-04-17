@@ -50,7 +50,7 @@ class ClaudeCodeBackend:
         self,
         *,
         model: str = "claude-opus-4-7",
-        max_turns: int = 15,
+        max_turns: int = 100,
         cwd: str | None = None,
         effort: str | None = "high",
     ) -> None:
