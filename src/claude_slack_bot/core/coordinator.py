@@ -867,14 +867,16 @@ class ThreadCoordinator:
         if event.type == EventType.TOOL_ACTIVITY:
             # Update the thinking message to show what tool Claude is using
             buf = self._stream_buffers.get(thread_ts)
-            if buf and not buf.has_content and buf._thinking_ts and buf._thinking_channel:
+            if buf and buf._thinking_ts and buf._thinking_channel:
                 tool_emoji = {"Bash": ":terminal:", "Read": ":eyes:", "Write": ":pencil2:", "Edit": ":pencil2:",
                               "Grep": ":mag:", "Glob": ":mag:", "WebFetch": ":globe_with_meridians:",
                               "WebSearch": ":mag_right:"}.get(event.tool_name, ":gear:")
+                # Track tool call count
+                buf._tool_count = getattr(buf, "_tool_count", 0) + 1
                 try:
                     await client.chat_update(
                         channel=buf._thinking_channel, ts=buf._thinking_ts,
-                        text=f"{tool_emoji} Using {event.tool_name}...",
+                        text=f"{tool_emoji} Using {event.tool_name}... (step {buf._tool_count})",
                     )
                 except Exception:
                     pass
