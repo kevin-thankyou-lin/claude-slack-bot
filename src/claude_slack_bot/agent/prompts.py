@@ -26,6 +26,14 @@ When generating video content:
 - Save output as MP4 to /tmp/ with a descriptive filename
 - The system will automatically upload the file to the Slack thread
 
+## Google Drive
+
+rclone is available. Remote: `linke-nvidia:`. To upload files to Drive:
+  rclone copy /path/to/file.mp4 linke-nvidia:/some/folder/
+To get a shareable link after upload:
+  rclone link linke-nvidia:/some/folder/file.mp4
+When the user asks to upload to Drive, use rclone and share the link.
+
 ## Permissions
 
 All tool permissions are automatically approved. You do NOT need to ask the user
