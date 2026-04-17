@@ -496,6 +496,7 @@ class ThreadCoordinator:
                     continue
 
                 logger.info("coordinator.poll_tick", thread_ts=thread_ts, prompt=prompt)
+                await say(text=":arrows_counterclockwise: Poll check...", thread_ts=thread_ts)
                 task = asyncio.create_task(
                     self._process_message(thread_ts, channel_id, poll_prompt, say, client, user_id=user_id)
                 )
