@@ -13,6 +13,8 @@ class Thread:
     auto_approve: bool = False
     cwd: str = ""
     cc_session_id: str = ""
+    model: str = ""
+    effort: str = ""
     status: str = "active"
     user_id: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

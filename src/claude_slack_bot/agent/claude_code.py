@@ -64,6 +64,10 @@ class ClaudeCodeBackend:
         self._clients: dict[str, ClaudeSDKClient] = {}
         # session_id -> cwd
         self._session_cwd: dict[str, str] = {}
+        # session_id -> model override
+        self._session_model: dict[str, str] = {}
+        # session_id -> effort override
+        self._session_effort: dict[str, str] = {}
         # session_id -> Claude Code's own session UUID (for resume)
         self._cc_session_ids: dict[str, str] = {}
         # session_id -> last activity timestamp
@@ -87,11 +91,13 @@ class ClaudeCodeBackend:
         """Connect an SDK client, falling back to a fresh session if resume fails."""
 
         def _make_opts(resume: str | None) -> ClaudeCodeOptions:
+            effective_model = self._session_model.get(session_id) or self.model
+            effective_effort = self._session_effort.get(session_id) or self.effort
             extra_args: dict[str, str | None] = {}
-            if self.effort:
-                extra_args["effort"] = self.effort
+            if effective_effort:
+                extra_args["effort"] = effective_effort
             return ClaudeCodeOptions(
-                model=self.model,
+                model=effective_model,
                 max_turns=self.max_turns,
                 append_system_prompt=SYSTEM_PROMPT,
                 allowed_tools=ALL_TOOLS,
@@ -143,6 +149,18 @@ class ClaudeCodeBackend:
         old_cwd = self._session_cwd.get(session_id)
         self._session_cwd[session_id] = cwd
         if old_cwd != cwd and session_id in self._clients:
+            await self._reset_client(session_id)
+
+    async def set_session_model(self, session_id: str, model: str) -> None:
+        old = self._session_model.get(session_id)
+        self._session_model[session_id] = model
+        if old != model and session_id in self._clients:
+            await self._reset_client(session_id)
+
+    async def set_session_effort(self, session_id: str, effort: str) -> None:
+        old = self._session_effort.get(session_id)
+        self._session_effort[session_id] = effort
+        if old != effort and session_id in self._clients:
             await self._reset_client(session_id)
 
     def set_auto_approve(self, session_id: str, *, enabled: bool) -> None:

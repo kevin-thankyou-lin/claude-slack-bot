@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS threads (
     auto_approve    INTEGER NOT NULL DEFAULT 0,
     cwd             TEXT NOT NULL DEFAULT '',
     cc_session_id   TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
+    effort          TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'active',
     user_id         TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -56,7 +58,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(SCHEMA)
             # Migrations for existing databases
-            for col, default in [("user_id", "''"), ("cc_session_id", "''")]:
+            for col, default in [("user_id", "''"), ("cc_session_id", "''"), ("model", "''"), ("effort", "''")]:
                 try:
                     await db.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
                     await db.commit()

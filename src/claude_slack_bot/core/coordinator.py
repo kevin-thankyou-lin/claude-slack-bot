@@ -175,6 +175,34 @@ class ThreadCoordinator:
                     self._active[thread_ts] = task
             return
 
+        # Handle model command: "model sonnet" or "model opus"
+        model_match = re.match(r"^model\s+(\S+)\s*(.*)?$", text.strip(), re.IGNORECASE | re.DOTALL)
+        if model_match:
+            model_name = model_match.group(1).strip()
+            remaining = (model_match.group(2) or "").strip()
+            await self._handle_model(thread_ts, channel_id, model_name, say, user_id=user_id)
+            if remaining:
+                if thread_ts not in self._active or self._active[thread_ts].done():
+                    task = asyncio.create_task(
+                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
+                    )
+                    self._active[thread_ts] = task
+            return
+
+        # Handle effort command: "effort high" or "effort low"
+        effort_match = re.match(r"^effort\s+(\S+)\s*(.*)?$", text.strip(), re.IGNORECASE | re.DOTALL)
+        if effort_match:
+            effort_val = effort_match.group(1).strip().lower()
+            remaining = (effort_match.group(2) or "").strip()
+            await self._handle_effort(thread_ts, channel_id, effort_val, say, user_id=user_id)
+            if remaining:
+                if thread_ts not in self._active or self._active[thread_ts].done():
+                    task = asyncio.create_task(
+                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
+                    )
+                    self._active[thread_ts] = task
+            return
+
         # Handle poll command: "poll 10m check status" or "poll stop"
         poll_match = re.match(r"^poll\s+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
         if poll_match:
@@ -229,6 +257,66 @@ class ThreadCoordinator:
                     return child
 
         return None
+
+    async def _handle_model(
+        self, thread_ts: str, channel_id: str, model_name: str, say: Any, user_id: str = ""
+    ) -> None:
+        """Set the model for a thread. Disconnects the client so it reconnects with the new model."""
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+            if thread is None:
+                session_id = await self.backend.create_session()
+                thread = Thread(
+                    thread_ts=thread_ts,
+                    channel_id=channel_id,
+                    session_id=session_id,
+                    backend_type="claude-code",
+                    model=model_name,
+                    user_id=user_id,
+                )
+                await queries.upsert_thread(db, thread)
+            else:
+                thread.model = model_name
+                await queries.upsert_thread(db, thread)
+
+        # Disconnect client so it reconnects with new model
+        if hasattr(self.backend, "set_session_model"):
+            await self.backend.set_session_model(thread.session_id, model_name)
+
+        await say(text=f":robot_face: Model set to `{model_name}`", thread_ts=thread_ts)
+        logger.info("coordinator.model_set", thread_ts=thread_ts, model=model_name)
+
+    async def _handle_effort(
+        self, thread_ts: str, channel_id: str, effort_val: str, say: Any, user_id: str = ""
+    ) -> None:
+        """Set the effort level for a thread."""
+        valid = ("low", "medium", "high", "max")
+        if effort_val not in valid:
+            await say(text=f":x: Invalid effort. Use one of: {', '.join(valid)}", thread_ts=thread_ts)
+            return
+
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+            if thread is None:
+                session_id = await self.backend.create_session()
+                thread = Thread(
+                    thread_ts=thread_ts,
+                    channel_id=channel_id,
+                    session_id=session_id,
+                    backend_type="claude-code",
+                    effort=effort_val,
+                    user_id=user_id,
+                )
+                await queries.upsert_thread(db, thread)
+            else:
+                thread.effort = effort_val
+                await queries.upsert_thread(db, thread)
+
+        if hasattr(self.backend, "set_session_effort"):
+            await self.backend.set_session_effort(thread.session_id, effort_val)
+
+        await say(text=f":zap: Effort set to `{effort_val}`", thread_ts=thread_ts)
+        logger.info("coordinator.effort_set", thread_ts=thread_ts, effort=effort_val)
 
     async def _handle_cd(self, thread_ts: str, channel_id: str, path: str, say: Any, user_id: str = "") -> None:
         """Set the working directory for a thread."""
@@ -525,6 +613,10 @@ class ThreadCoordinator:
             self.backend.set_auto_approve(thread.session_id, enabled=True)
         if thread.cwd and hasattr(self.backend, "set_session_cwd"):
             await self.backend.set_session_cwd(thread.session_id, thread.cwd)
+        if thread.model and hasattr(self.backend, "set_session_model"):
+            await self.backend.set_session_model(thread.session_id, thread.model)
+        if thread.effort and hasattr(self.backend, "set_session_effort"):
+            await self.backend.set_session_effort(thread.session_id, thread.effort)
         if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
             self.backend.set_cc_session_id(thread.session_id, thread.cc_session_id)
 
