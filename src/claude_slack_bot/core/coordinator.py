@@ -747,21 +747,19 @@ class ThreadCoordinator:
         """Process a message, then drain any queued messages for this thread."""
         await self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id)
 
-        # Drain queued messages — only process the LAST one (skip stale intermediate messages)
+        # Drain queued messages — combine all into one message
         queue = self._queues.get(thread_ts)
         if queue and not queue.empty():
-            last_msg = None
-            skipped = 0
+            parts = []
+            last_meta = None
             while not queue.empty():
-                last_msg = await queue.get()
-                if not queue.empty():
-                    skipped += 1
-            if skipped:
-                logger.info("coordinator.drain_skipped_stale", thread_ts=thread_ts, skipped=skipped)
-            if last_msg:
-                q_thread_ts, q_channel_id, q_text, q_say, q_client, q_user_id = last_msg
-                logger.info("coordinator.drain_latest", thread_ts=q_thread_ts, text=q_text[:50])
-                await self._process_message(q_thread_ts, q_channel_id, q_text, q_say, q_client, user_id=q_user_id)
+                last_meta = await queue.get()
+                parts.append(last_meta[2])  # index 2 = text
+            if last_meta and parts:
+                combined = "\n".join(parts)
+                q_thread_ts, q_channel_id, _, q_say, q_client, q_user_id = last_meta
+                logger.info("coordinator.drain_combined", thread_ts=q_thread_ts, count=len(parts))
+                await self._process_message(q_thread_ts, q_channel_id, combined, q_say, q_client, user_id=q_user_id)
 
     async def _process_message(
         self,
