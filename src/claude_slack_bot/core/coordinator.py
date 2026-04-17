@@ -219,9 +219,14 @@ class ThreadCoordinator:
             await self._handle_done(thread_ts, say)
             return
 
-        # Handle compact/reset — clear context but keep cwd/model/effort
-        if text.strip().lower() in ("compact", "reset"):
-            await self._handle_compact(thread_ts, say)
+        # Handle reset — full wipe, fresh session
+        if text.strip().lower() == "reset":
+            await self._handle_reset(thread_ts, say)
+            return
+
+        # Handle compact — summarize conversation, start fresh with summary
+        if text.strip().lower() == "compact":
+            await self._handle_compact(thread_ts, channel_id, say, client, user_id)
             return
 
         # Handle btw (side-channel question — runs in parallel, doesn't block the main task)
@@ -409,9 +414,8 @@ class ThreadCoordinator:
         )
         logger.info("coordinator.done", thread_ts=thread_ts)
 
-    async def _handle_compact(self, thread_ts: str, say: Any) -> None:
-        """Reset Claude's context while keeping thread settings (cwd, model, effort)."""
-        # Stop running task
+    async def _reset_thread_client(self, thread_ts: str) -> Thread | None:
+        """Stop running task and disconnect client. Returns the thread record."""
         task = self._active.get(thread_ts)
         if task and not task.done():
             async with self.db._connect() as db:
@@ -422,28 +426,69 @@ class ThreadCoordinator:
             self._active.pop(thread_ts, None)
             self._stream_buffers.pop(thread_ts, None)
 
-        # Disconnect client (clears context) but keep thread record with cwd/model/effort
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
         if thread:
             if hasattr(self.backend, "_reset_client"):
                 await self.backend._reset_client(thread.session_id)
-            # Clear the cc_session_id so it starts fresh (no resume)
             thread.cc_session_id = ""
             async with self.db._connect() as db:
                 await queries.upsert_thread(db, thread)
+        return thread
 
-        settings = []
+    def _settings_label(self, thread: Thread | None) -> str:
+        parts = []
         if thread and thread.cwd:
-            settings.append(f"cwd=`{thread.cwd}`")
+            parts.append(f"cwd=`{thread.cwd}`")
         if thread and thread.model:
-            settings.append(f"model=`{thread.model}`")
+            parts.append(f"model=`{thread.model}`")
         if thread and thread.effort:
-            settings.append(f"effort=`{thread.effort}`")
-        kept = f" Kept: {', '.join(settings)}." if settings else ""
+            parts.append(f"effort=`{thread.effort}`")
+        return f" Kept: {', '.join(parts)}." if parts else ""
 
-        await say(text=f":broom: Context cleared — fresh session.{kept}", thread_ts=thread_ts)
-        logger.info("coordinator.compact", thread_ts=thread_ts)
+    async def _handle_reset(self, thread_ts: str, say: Any) -> None:
+        """Full wipe — fresh session, no memory of prior conversation."""
+        thread = await self._reset_thread_client(thread_ts)
+        kept = self._settings_label(thread)
+        await say(text=f":wastebasket: Reset — fresh session, no prior context.{kept}", thread_ts=thread_ts)
+        logger.info("coordinator.reset", thread_ts=thread_ts)
+
+    async def _handle_compact(self, thread_ts: str, channel_id: str, say: Any, client: Any, user_id: str) -> None:
+        """Summarize conversation, then start fresh session with summary injected."""
+        await say(text=":broom: Compacting — summarizing conversation...", thread_ts=thread_ts)
+
+        # Get conversation history
+        async with self.db._connect() as db:
+            messages = await queries.get_messages(db, thread_ts)
+
+        # Build a conversation transcript for summarization
+        transcript_parts = []
+        for msg in messages[-30:]:  # last 30 messages to avoid huge transcripts
+            role = "User" if msg.role == "user" else "Claude"
+            content = msg.content[:500]  # truncate long messages
+            transcript_parts.append(f"{role}: {content}")
+        transcript = "\n".join(transcript_parts)
+
+        # Reset the client
+        thread = await self._reset_thread_client(thread_ts)
+        if not thread:
+            await say(text=":x: No thread found to compact.", thread_ts=thread_ts)
+            return
+
+        # Ask Claude to summarize in the fresh session
+        summary_prompt = (
+            f"Here is a summary of our prior conversation in this thread. "
+            f"Use it as context for future messages, but do NOT repeat it back to the user.\n\n"
+            f"---\n{transcript}\n---\n\n"
+            f"Acknowledge briefly that you have context from the prior conversation."
+        )
+
+        # Process the summary as a message so it becomes part of the new session's context
+        task = asyncio.create_task(
+            self._process_message(thread_ts, channel_id, summary_prompt, say, client, user_id=user_id)
+        )
+        self._active[thread_ts] = task
+        logger.info("coordinator.compact", thread_ts=thread_ts, msg_count=len(messages))
 
     async def _handle_poll(
         self, thread_ts: str, channel_id: str, args: str, say: Any, client: Any, user_id: str
