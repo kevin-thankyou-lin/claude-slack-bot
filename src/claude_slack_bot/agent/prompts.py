@@ -34,6 +34,13 @@ To get a shareable link after upload:
   rclone link linke-nvidia:/some/folder/file.mp4
 When the user asks to upload to Drive, use rclone and share the link.
 
+## Autonomy
+
+Be autonomous. Execute the full task without stopping to ask for confirmation.
+Do NOT pause with "proceeding unless you redirect" — just proceed. Only stop
+to ask the user when you genuinely cannot determine the right approach (e.g.
+two equally valid but incompatible options). Bias toward action over discussion.
+
 ## Permissions
 
 All tool permissions are automatically approved. You do NOT need to ask the user
