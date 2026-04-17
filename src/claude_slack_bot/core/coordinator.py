@@ -219,6 +219,11 @@ class ThreadCoordinator:
             await self._handle_done(thread_ts, say)
             return
 
+        # Handle compact/reset — clear context but keep cwd/model/effort
+        if text.strip().lower() in ("compact", "reset"):
+            await self._handle_compact(thread_ts, say)
+            return
+
         # Handle btw (side-channel question — runs in parallel, doesn't block the main task)
         btw_match = re.match(r"^btw[:\s]+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
         if btw_match:
@@ -403,6 +408,42 @@ class ThreadCoordinator:
             thread_ts=thread_ts,
         )
         logger.info("coordinator.done", thread_ts=thread_ts)
+
+    async def _handle_compact(self, thread_ts: str, say: Any) -> None:
+        """Reset Claude's context while keeping thread settings (cwd, model, effort)."""
+        # Stop running task
+        task = self._active.get(thread_ts)
+        if task and not task.done():
+            async with self.db._connect() as db:
+                thread = await queries.get_thread(db, thread_ts)
+            if thread and hasattr(self.backend, "interrupt"):
+                await self.backend.interrupt(thread.session_id)
+            task.cancel()
+            self._active.pop(thread_ts, None)
+            self._stream_buffers.pop(thread_ts, None)
+
+        # Disconnect client (clears context) but keep thread record with cwd/model/effort
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+        if thread:
+            if hasattr(self.backend, "_reset_client"):
+                await self.backend._reset_client(thread.session_id)
+            # Clear the cc_session_id so it starts fresh (no resume)
+            thread.cc_session_id = ""
+            async with self.db._connect() as db:
+                await queries.upsert_thread(db, thread)
+
+        settings = []
+        if thread and thread.cwd:
+            settings.append(f"cwd=`{thread.cwd}`")
+        if thread and thread.model:
+            settings.append(f"model=`{thread.model}`")
+        if thread and thread.effort:
+            settings.append(f"effort=`{thread.effort}`")
+        kept = f" Kept: {', '.join(settings)}." if settings else ""
+
+        await say(text=f":broom: Context cleared — fresh session.{kept}", thread_ts=thread_ts)
+        logger.info("coordinator.compact", thread_ts=thread_ts)
 
     async def _handle_poll(
         self, thread_ts: str, channel_id: str, args: str, say: Any, client: Any, user_id: str
