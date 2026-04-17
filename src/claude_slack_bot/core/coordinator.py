@@ -26,6 +26,13 @@ _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
 STREAM_FIRST_POST_DELAY = 0.5  # wait this long before first post (avoids flicker for fast replies)
 
+# Sentinel Claude can include in its final response to self-schedule a poll.
+# Format: POLL_START: <interval> <prompt>  e.g. POLL_START: 10m check conversion log
+POLL_START_RE = re.compile(
+    r"POLL_START:\s*(\d+)\s*(m|min|h|hr|s|sec)\s+(.+?)(?:\n|$)",
+    re.IGNORECASE,
+)
+
 
 class _StreamBuffer:
     """Accumulates text deltas and posts a single Slack message.
@@ -334,7 +341,20 @@ class ThreadCoordinator:
         amount = int(interval_match.group(1))
         unit = interval_match.group(2).lower()
         prompt = interval_match.group(3).strip()
+        await self._start_poll_task(thread_ts, channel_id, prompt, amount, unit, say, client, user_id)
 
+    async def _start_poll_task(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        prompt: str,
+        amount: int,
+        unit: str,
+        say: Any,
+        client: Any,
+        user_id: str,
+    ) -> None:
+        """Schedule a recurring poll, replacing any existing one for this thread."""
         if unit in ("m", "min"):
             interval_secs = amount * 60
         elif unit in ("h", "hr"):
@@ -342,12 +362,10 @@ class ThreadCoordinator:
         else:
             interval_secs = amount
 
-        # Cancel existing poll if any
         old_poll = self._polls.pop(thread_ts, None)
         if old_poll:
             old_poll.cancel()
 
-        # Start the poll
         poll_task = asyncio.create_task(
             self._run_poll(thread_ts, channel_id, prompt, interval_secs, say, client, user_id)
         )
@@ -501,6 +519,26 @@ class ThreadCoordinator:
         async for event in self.backend.send_tool_result(thread.session_id, tool_use_id, result):
             await self._handle_event(event, thread_ts, thread.session_id, user_id, say, client)
 
+    async def _sync_backend_state(self, thread: Thread) -> None:
+        """Push per-thread settings (auto-approve, cwd, resume ID) into the backend."""
+        if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
+            self.backend.set_auto_approve(thread.session_id, enabled=True)
+        if thread.cwd and hasattr(self.backend, "set_session_cwd"):
+            await self.backend.set_session_cwd(thread.session_id, thread.cwd)
+        if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
+            self.backend.set_cc_session_id(thread.session_id, thread.cc_session_id)
+
+    def _extract_poll_request(self, buf: _StreamBuffer) -> tuple[int, str, str] | None:
+        """Find and strip a POLL_START sentinel from the buffer. Returns (amount, unit, prompt)."""
+        match = POLL_START_RE.search(buf._text)
+        if not match:
+            return None
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        prompt = match.group(3).strip()
+        buf._text = POLL_START_RE.sub("", buf._text).strip()
+        return amount, unit, prompt
+
     # ── internals ────────────────────────────────────────────────────────────
 
     async def _process_and_drain(
@@ -560,14 +598,7 @@ class ThreadCoordinator:
             # Resolve effective user_id (prefer thread record, fall back to event)
             effective_user_id = thread.user_id or user_id
 
-            # Sync per-thread state to backend
-            if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
-                self.backend.set_auto_approve(thread.session_id, enabled=True)
-            if thread.cwd and hasattr(self.backend, "set_session_cwd"):
-                await self.backend.set_session_cwd(thread.session_id, thread.cwd)
-            # Restore Claude Code session ID for resume after restart
-            if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
-                self.backend.set_cc_session_id(thread.session_id, thread.cc_session_id)
+            await self._sync_backend_state(thread)
 
             message = text
 
@@ -588,24 +619,32 @@ class ThreadCoordinator:
                     await buf.flush()
 
             flush_task = asyncio.create_task(_periodic_flush())
+            poll_request: tuple[int, str, str] | None = None
             try:
                 async for event in self.backend.send_message(thread.session_id, message):
                     await self._handle_event(event, thread_ts, thread.session_id, effective_user_id, say, client)
             finally:
                 flush_task.cancel()
                 if buf.has_content:
+                    poll_request = self._extract_poll_request(buf)
                     final_text = await buf.finalize()
                     async with self.db._connect() as db_conn:
                         await queries.add_message(db_conn, thread_ts, "assistant", final_text)
                 self._stream_buffers.pop(thread_ts, None)
 
-                # Persist the Claude Code session ID for resume after restart
-                if hasattr(self.backend, "get_cc_session_id"):
-                    cc_sid = self.backend.get_cc_session_id(thread.session_id)
-                    if cc_sid and cc_sid != thread.cc_session_id:
-                        thread.cc_session_id = cc_sid
-                        async with self.db._connect() as db_conn:
-                            await queries.upsert_thread(db_conn, thread)
+            # Persist the Claude Code session ID for resume after restart
+            if hasattr(self.backend, "get_cc_session_id"):
+                cc_sid = self.backend.get_cc_session_id(thread.session_id)
+                if cc_sid and cc_sid != thread.cc_session_id:
+                    thread.cc_session_id = cc_sid
+                    async with self.db._connect() as db_conn:
+                        await queries.upsert_thread(db_conn, thread)
+
+            if poll_request is not None:
+                amount, unit, prompt = poll_request
+                await self._start_poll_task(
+                    thread_ts, channel_id, prompt, amount, unit, say, client, effective_user_id
+                )
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)

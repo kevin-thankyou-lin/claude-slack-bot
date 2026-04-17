@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     agent_id: str = ""
     agent_version: int = 1
-    default_model: str = "sonnet"  # "sonnet", "opus", "haiku", or full model ID
+    default_model: str = "claude-opus-4-7"  # "sonnet", "opus", "haiku", or full model ID
+    effort: str = "high"  # Claude Code reasoning effort: low, medium, high, xhigh, max
 
     # Database
     db_path: str = "data/claude_slack_bot.db"

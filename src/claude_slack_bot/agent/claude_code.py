@@ -49,13 +49,15 @@ class ClaudeCodeBackend:
     def __init__(
         self,
         *,
-        model: str = "sonnet",
+        model: str = "claude-opus-4-7",
         max_turns: int = 15,
         cwd: str | None = None,
+        effort: str | None = "high",
     ) -> None:
         self.model = model
         self.max_turns = max_turns
         self.default_cwd = cwd
+        self.effort = effort
         self._auto_approve: set[str] = set()
 
         # One SDK client per session (thread)
@@ -85,6 +87,9 @@ class ClaudeCodeBackend:
         """Connect an SDK client, falling back to a fresh session if resume fails."""
 
         def _make_opts(resume: str | None) -> ClaudeCodeOptions:
+            extra_args: dict[str, str | None] = {}
+            if self.effort:
+                extra_args["effort"] = self.effort
             return ClaudeCodeOptions(
                 model=self.model,
                 max_turns=self.max_turns,
@@ -93,6 +98,7 @@ class ClaudeCodeBackend:
                 include_partial_messages=True,
                 cwd=cwd,
                 resume=resume,
+                extra_args=extra_args,
             )
 
         client = ClaudeSDKClient(_make_opts(cc_session_id))

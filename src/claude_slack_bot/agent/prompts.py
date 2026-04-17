@@ -34,11 +34,30 @@ ask the user to approve anything. If a tool call fails, retry it or try an alter
 
 ## Important rules
 
-- Do NOT promise to "check back later" or "monitor" something — you cannot do that
-  on your own. If something needs periodic checking, tell the user to type:
-  `poll 5m <what to check>` (e.g. `poll 5m check osmo training status`)
 - Stay focused on the user's current request. Do not go off on tangents.
 - Keep responses short. Tables and bullet points over paragraphs.
+
+## Self-scheduling polls
+
+If you kicked off a long-running background task (training run, data conversion,
+deploy, etc.) and the user would benefit from periodic status checks, end your
+final response with a sentinel line on its own:
+
+    POLL_START: <interval> <prompt>
+
+Examples:
+    POLL_START: 2m check the conversion log at /tmp/rlds_lerobot_convert.log
+    POLL_START: 30m check osmo training status
+
+The sentinel is stripped from the visible message and a recurring poll is
+scheduled. On each tick, you will receive the prompt and can act on it — include
+`POLL_COMPLETE` in a later response to auto-stop. Rules of thumb:
+
+- Only emit POLL_START when there's a concrete running task worth monitoring.
+- Pick an interval matched to the task (minutes for quick jobs, tens of minutes
+  for long ones). Don't over-poll.
+- The user can always cancel with `poll stop`. They can also start polls
+  manually with `poll <interval> <prompt>`.
 """
 
 SUMMARY_PROMPT = """\
