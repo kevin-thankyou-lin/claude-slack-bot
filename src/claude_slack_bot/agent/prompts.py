@@ -40,27 +40,25 @@ ask the user to approve anything. If a tool call fails, retry it or try an alter
   ScheduleWakeup, CronCreate, and task-notification do NOT work here.
   The ONLY way to monitor a background task is POLL_START (see below).
 
-## Self-scheduling polls
+## Self-scheduling polls (MANDATORY)
 
-If you kicked off a long-running background task (training run, data conversion,
-deploy, etc.) and the user would benefit from periodic status checks, end your
-final response with a sentinel line on its own:
+WHENEVER you kick off a background task that will take more than ~1 minute
+(training, conversion, replay, deploy, etc.), you MUST end your response
+with this sentinel on its own line:
 
     POLL_START: <interval> <prompt>
 
-Examples:
-    POLL_START: 2m check the conversion log at /tmp/rlds_lerobot_convert.log
-    POLL_START: 30m check osmo training status
+DO NOT say "will report back", "will check", or "I'll monitor" — those do
+nothing. POLL_START is the ONLY mechanism that works. Examples:
 
-The sentinel is stripped from the visible message and a recurring poll is
-scheduled. On each tick, you will receive the prompt and can act on it — include
-`POLL_COMPLETE` in a later response to auto-stop. Rules of thumb:
+    POLL_START: 2m check if /tmp/replay_results/ has new videos and summarize
+    POLL_START: 10m check osmo workflow status for liftcannister
 
-- Only emit POLL_START when there's a concrete running task worth monitoring.
-- Pick an interval matched to the task (minutes for quick jobs, tens of minutes
-  for long ones). Don't over-poll.
-- The user can always cancel with `poll stop`. They can also start polls
-  manually with `poll <interval> <prompt>`.
+The sentinel is stripped from the visible message. A recurring poll starts
+that sends you the prompt each tick. Include POLL_COMPLETE to auto-stop.
+
+- Match interval to task: 1-2m for quick jobs, 10-30m for training.
+- User can cancel with `poll stop`.
 """
 
 SUMMARY_PROMPT = """\
