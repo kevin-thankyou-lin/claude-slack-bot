@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import time
 
 import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -14,6 +17,19 @@ from .slack.app import create_slack_app
 from .utils.logging import setup_logging
 
 logger = structlog.get_logger()
+
+# Watchdog: restart if no Slack events for this many seconds
+WATCHDOG_TIMEOUT = 300  # 5 minutes
+WATCHDOG_CHECK_INTERVAL = 60  # check every minute
+
+# Shared timestamp updated by the Slack listener middleware
+_last_event_time: float = time.monotonic()
+
+
+def touch_watchdog() -> None:
+    """Called by Slack middleware on every event to prove the connection is alive."""
+    global _last_event_time  # noqa: PLW0603
+    _last_event_time = time.monotonic()
 
 
 def _create_backend(settings: Settings) -> ClaudeCodeBackend:
@@ -42,6 +58,18 @@ def _create_backend(settings: Settings) -> ClaudeCodeBackend:
     return MessagesBackend(client=client, model=settings.default_model)  # type: ignore[return-value]
 
 
+async def _watchdog() -> None:
+    """Monitor the Slack connection and restart the process if it goes silent."""
+    while True:
+        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+        idle = time.monotonic() - _last_event_time
+        if idle > WATCHDOG_TIMEOUT:
+            logger.error("watchdog.timeout", idle_seconds=int(idle))
+            logger.info("watchdog.restarting")
+            # Re-exec the process — clean restart, same args
+            os.execv(sys.executable, [sys.executable, "-m", "claude_slack_bot.main"])
+
+
 async def main() -> None:
     settings = Settings()
     setup_logging(settings.log_level)
@@ -64,11 +92,21 @@ async def main() -> None:
     coordinator = ThreadCoordinator(backend=backend, db=db, projects_dir=settings.projects_dir)
     permission_mgr = PermissionManager(db=db)
 
-    # Create and start Slack app
+    # Create and start Slack app with watchdog middleware
     app = create_slack_app(settings, coordinator, permission_mgr)
+
+    # Add middleware that touches the watchdog on every event
+    @app.middleware
+    async def watchdog_middleware(body: object, next: object) -> None:
+        touch_watchdog()
+        await next()
+
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
 
-    logger.info("bot.ready", msg="Claude Slack Bot is running. Press Ctrl+C to stop.")
+    # Start watchdog in background
+    _wd = asyncio.create_task(_watchdog())  # noqa: RUF006
+
+    logger.info("bot.ready", msg="Claude Slack Bot is running. Watchdog active.")
     await handler.start_async()
 
 
