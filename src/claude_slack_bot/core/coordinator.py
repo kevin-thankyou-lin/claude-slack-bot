@@ -209,23 +209,27 @@ class ThreadCoordinator:
             await self._handle_poll(thread_ts, channel_id, poll_match.group(1).strip(), say, client, user_id)
             return
 
-        # Handle stop/cancel command (also stops polls)
+        # Handle stop/cancel command (also stops polls, flushes queue)
         if text.strip().lower() in ("stop", "cancel", "abort", "nevermind", "nvm"):
+            self._flush_queue(thread_ts)
             await self._handle_stop(thread_ts, say)
             return
 
         # Handle done — stop task and disconnect the client to free resources
         if text.strip().lower() == "done":
+            self._flush_queue(thread_ts)
             await self._handle_done(thread_ts, say)
             return
 
         # Handle reset — full wipe, fresh session
         if text.strip().lower() == "reset":
+            self._flush_queue(thread_ts)
             await self._handle_reset(thread_ts, say)
             return
 
         # Handle compact — summarize conversation, start fresh with summary
         if text.strip().lower() == "compact":
+            self._flush_queue(thread_ts)
             await self._handle_compact(thread_ts, channel_id, say, client, user_id)
             return
 
@@ -413,6 +417,17 @@ class ThreadCoordinator:
             thread_ts=thread_ts,
         )
         logger.info("coordinator.done", thread_ts=thread_ts)
+
+    def _flush_queue(self, thread_ts: str) -> None:
+        """Drop all queued messages for a thread."""
+        queue = self._queues.pop(thread_ts, None)
+        if queue:
+            count = 0
+            while not queue.empty():
+                queue.get_nowait()
+                count += 1
+            if count:
+                logger.info("coordinator.queue_flushed", thread_ts=thread_ts, dropped=count)
 
     async def _reset_thread_client(self, thread_ts: str) -> Thread | None:
         """Stop running task and disconnect client. Returns the thread record."""
@@ -732,12 +747,21 @@ class ThreadCoordinator:
         """Process a message, then drain any queued messages for this thread."""
         await self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id)
 
-        # Drain queued messages
+        # Drain queued messages — only process the LAST one (skip stale intermediate messages)
         queue = self._queues.get(thread_ts)
-        while queue and not queue.empty():
-            q_thread_ts, q_channel_id, q_text, q_say, q_client, q_user_id = await queue.get()
-            logger.info("coordinator.drain_queued", thread_ts=q_thread_ts, text=q_text[:50])
-            await self._process_message(q_thread_ts, q_channel_id, q_text, q_say, q_client, user_id=q_user_id)
+        if queue and not queue.empty():
+            last_msg = None
+            skipped = 0
+            while not queue.empty():
+                last_msg = await queue.get()
+                if not queue.empty():
+                    skipped += 1
+            if skipped:
+                logger.info("coordinator.drain_skipped_stale", thread_ts=thread_ts, skipped=skipped)
+            if last_msg:
+                q_thread_ts, q_channel_id, q_text, q_say, q_client, q_user_id = last_msg
+                logger.info("coordinator.drain_latest", thread_ts=q_thread_ts, text=q_text[:50])
+                await self._process_message(q_thread_ts, q_channel_id, q_text, q_say, q_client, user_id=q_user_id)
 
     async def _process_message(
         self,
