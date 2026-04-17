@@ -8,6 +8,7 @@ from typing import AsyncIterator, Protocol
 class EventType(Enum):
     TEXT = "text"
     TEXT_DELTA = "text_delta"
+    TOOL_ACTIVITY = "tool_activity"
     TOOL_USE = "tool_use"
     TOOL_CONFIRMATION_NEEDED = "tool_confirmation_needed"
     TOOL_RESULT = "tool_result"

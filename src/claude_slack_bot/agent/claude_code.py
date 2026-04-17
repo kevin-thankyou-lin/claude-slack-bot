@@ -206,6 +206,10 @@ class ClaudeCodeBackend:
 
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
+                    # Check for tool use activity
+                    tool_name = self._extract_tool_start(msg)
+                    if tool_name:
+                        yield SessionEvent(type=EventType.TOOL_ACTIVITY, tool_name=tool_name)
                     delta_text = self._extract_text_delta(msg)
                     if delta_text:
                         yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
@@ -234,6 +238,15 @@ class ClaudeCodeBackend:
     async def shutdown(self) -> None:
         for sid in list(self._clients.keys()):
             await self._reset_client(sid)
+
+    def _extract_tool_start(self, event: StreamEvent) -> str:
+        """Extract tool name from a content_block_start event."""
+        evt = event.event
+        if evt.get("type") == "content_block_start":
+            block = evt.get("content_block", {})
+            if block.get("type") == "tool_use":
+                return block.get("name", "")
+        return ""
 
     def _extract_text_delta(self, event: StreamEvent) -> str:
         evt = event.event
