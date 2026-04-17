@@ -203,6 +203,7 @@ class ClaudeCodeBackend:
             client = await self._get_client(session_id)
 
             await client.query(content, session_id=session_id)
+            got_deltas = False
 
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -212,11 +213,15 @@ class ClaudeCodeBackend:
                         yield SessionEvent(type=EventType.TOOL_ACTIVITY, tool_name=tool_name)
                     delta_text = self._extract_text_delta(msg)
                     if delta_text:
+                        got_deltas = True
                         yield SessionEvent(type=EventType.TEXT_DELTA, text=delta_text)
                 elif isinstance(msg, ResultMessage):
-                    # Capture the Claude Code session UUID for resume
                     if msg.session_id:
                         self._cc_session_ids[session_id] = msg.session_id
+                    # If no text deltas were streamed, emit the result as TEXT
+                    # so the stream buffer has something to post
+                    if msg.result and not got_deltas:
+                        yield SessionEvent(type=EventType.TEXT, text=msg.result)
                     yield SessionEvent(type=EventType.TURN_END, is_final=True)
                     return
 
