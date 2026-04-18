@@ -11,8 +11,7 @@
 set -euo pipefail
 
 # Load config
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/../.env"
+ENV_FILE="${NOTIFY_SLACK_ENV:-/home/linke/Projects/claude-slack-bot/.env}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "Error: .env not found at $ENV_FILE" >&2
