@@ -23,6 +23,7 @@ logger = structlog.get_logger()
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
+AUTO_COMPACT_THRESHOLD = 50  # auto-compact after this many messages in a thread
 STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
 STREAM_FIRST_POST_DELAY = 0.5  # wait this long before first post (avoids flicker for fast replies)
 
@@ -859,9 +860,16 @@ class ThreadCoordinator:
                     thread_ts, channel_id, prompt, amount, unit, say, client, effective_user_id
                 )
 
+            # Auto-compact: if thread has too many messages, compact to keep context clean
+            async with self.db._connect() as db_conn:
+                msg_count = await queries.get_message_count(db_conn, thread_ts)
+            if msg_count >= AUTO_COMPACT_THRESHOLD:
+                logger.info("coordinator.auto_compact", thread_ts=thread_ts, msg_count=msg_count)
+                await say(text=":broom: Auto-compacting (50+ messages)...", thread_ts=thread_ts)
+                await self._handle_compact(thread_ts, channel_id, say, client, effective_user_id)
             # Auto-continue: if Claude's response signals it wants to keep going,
             # send "continue" to kick off the next turn automatically
-            if buf.has_content and self._should_auto_continue(buf._text):
+            elif buf.has_content and self._should_auto_continue(buf._text):
                 logger.info("coordinator.auto_continue", thread_ts=thread_ts)
                 await self._process_message(
                     thread_ts, channel_id, "continue", say, client, user_id=effective_user_id
