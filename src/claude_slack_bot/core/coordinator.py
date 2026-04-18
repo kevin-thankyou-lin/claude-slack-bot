@@ -23,7 +23,7 @@ logger = structlog.get_logger()
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
-AUTO_COMPACT_THRESHOLD = 50  # auto-compact after this many messages in a thread
+AUTO_COMPACT_THRESHOLD = 150  # auto-compact after this many messages in a thread
 STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
 STREAM_FIRST_POST_DELAY = 0.5  # wait this long before first post (avoids flicker for fast replies)
 
@@ -479,7 +479,7 @@ class ThreadCoordinator:
 
         # Build a conversation transcript for summarization
         transcript_parts = []
-        for msg in messages[-30:]:  # last 30 messages to avoid huge transcripts
+        for msg in messages[-150:]:
             role = "User" if msg.role == "user" else "Claude"
             content = msg.content[:500]  # truncate long messages
             transcript_parts.append(f"{role}: {content}")
