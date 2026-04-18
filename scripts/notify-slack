@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Usage: notify-slack "your message here" [thread_ts]
+#
+# Posts a message to the user's DM channel via the Slack bot token.
+# If thread_ts is provided, posts as a thread reply.
+#
+# Examples:
+#   notify-slack "B1 eval done: 85% success"
+#   notify-slack "Training complete" "1776459237.245109"
+
+set -euo pipefail
+
+# Load config
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Error: .env not found at $ENV_FILE" >&2
+    exit 1
+fi
+
+SLACK_BOT_TOKEN=$(grep '^SLACK_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2)
+# Default DM channel — set this to your DM channel ID
+SLACK_CHANNEL="${SLACK_DM_CHANNEL:-D0ATCPH2M17}"
+
+MESSAGE="${1:?Usage: notify-slack \"message\" [thread_ts]}"
+THREAD_TS="${2:-}"
+
+# Build JSON payload
+if [[ -n "$THREAD_TS" ]]; then
+    PAYLOAD=$(jq -n \
+        --arg channel "$SLACK_CHANNEL" \
+        --arg text "$MESSAGE" \
+        --arg thread_ts "$THREAD_TS" \
+        '{channel: $channel, text: $text, thread_ts: $thread_ts}')
+else
+    PAYLOAD=$(jq -n \
+        --arg channel "$SLACK_CHANNEL" \
+        --arg text "$MESSAGE" \
+        '{channel: $channel, text: $text}')
+fi
+
+curl -s -X POST \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" \
+    https://slack.com/api/chat.postMessage | jq -r '.ok // .error'
