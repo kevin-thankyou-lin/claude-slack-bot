@@ -18,8 +18,8 @@ from .utils.logging import setup_logging
 
 logger = structlog.get_logger()
 
-# Watchdog: restart if no Slack events for this many seconds
-WATCHDOG_TIMEOUT = 300  # 5 minutes
+# Watchdog: restart if no activity for this many seconds
+WATCHDOG_TIMEOUT = 600  # 10 minutes — must be longer than the longest turn
 WATCHDOG_CHECK_INTERVAL = 60  # check every minute
 
 # Shared timestamp updated by the Slack listener middleware

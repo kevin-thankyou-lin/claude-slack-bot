@@ -885,6 +885,9 @@ class ThreadCoordinator:
         client: Any,
     ) -> None:
         if event.type == EventType.TOOL_ACTIVITY:
+            # Keep watchdog alive during long tool-use turns
+            from ..main import touch_watchdog  # noqa: PLC0415
+            touch_watchdog()
             # Update the thinking message to show what tool Claude is using
             buf = self._stream_buffers.get(thread_ts)
             if buf and buf._thinking_ts and buf._thinking_channel:
@@ -901,6 +904,8 @@ class ThreadCoordinator:
                 except Exception:
                     pass
         elif event.type == EventType.TEXT_DELTA:
+            from ..main import touch_watchdog  # noqa: PLC0415
+            touch_watchdog()
             buf = self._stream_buffers.get(thread_ts)
             if buf:
                 await buf.append(event.text)
