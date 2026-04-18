@@ -485,6 +485,11 @@ class ThreadCoordinator:
             transcript_parts.append(f"{role}: {content}")
         transcript = "\n".join(transcript_parts)
 
+        # Clear old messages so the count resets
+        async with self.db._connect() as db:
+            await db.execute("DELETE FROM messages WHERE thread_ts = ?", (thread_ts,))
+            await db.commit()
+
         # Reset the client
         thread = await self._reset_thread_client(thread_ts)
         if not thread:
