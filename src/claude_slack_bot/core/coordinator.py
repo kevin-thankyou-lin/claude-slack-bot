@@ -34,6 +34,18 @@ POLL_START_RE = re.compile(
     re.IGNORECASE,
 )
 
+# When Claude promises to follow up but forgets POLL_START, auto-inject one.
+_PROMISE_PATTERNS = re.compile(
+    r"\b(?:"
+    r"will\s+(?:report\s+back|let\s+you\s+know|update(?:\s+you)?|ping(?:\s+you)?|follow[- ]up|check\s+back|circle\s+back)"
+    r"|i['']?ll\s+(?:report|update|ping|let\s+you\s+know|check|monitor|watch|keep\s+an\s+eye)"
+    r"|(?:awaiting|waiting\s+for|once)\s+(?:the\s+)?(?:supervisor|tmux|result|response|answer|reply|outcome|eval|build|training|job|workflow|ckpt|checkpoint)"
+    r"|when\s+(?:the\s+)?(?:supervisor|tmux|it|they|eval|build|training|workflow|job|ckpt|checkpoint)\s+(?:answers|responds|returns|finishes|completes|lands|comes\s+back|is\s+done|is\s+ready)"
+    r")\b",
+    re.IGNORECASE,
+)
+AUTO_POLL_INTERVAL_MIN = 3  # default polling interval if Claude forgot POLL_START
+
 
 class _StreamBuffer:
     """Accumulates text deltas and posts a single Slack message.
@@ -741,15 +753,31 @@ class ThreadCoordinator:
         return bool(self._AUTO_CONTINUE_PATTERNS.search(tail))
 
     def _extract_poll_request(self, buf: _StreamBuffer) -> tuple[int, str, str] | None:
-        """Find and strip a POLL_START sentinel from the buffer. Returns (amount, unit, prompt)."""
+        """Find and strip a POLL_START sentinel from the buffer. Returns (amount, unit, prompt).
+
+        Falls back to auto-detection: if Claude promised to follow up (e.g. "will report back")
+        without emitting an explicit POLL_START, synthesize a poll so the promise is honored.
+        """
         match = POLL_START_RE.search(buf._text)
-        if not match:
-            return None
-        amount = int(match.group(1))
-        unit = match.group(2).lower()
-        prompt = match.group(3).strip()
-        buf._text = POLL_START_RE.sub("", buf._text).strip()
-        return amount, unit, prompt
+        if match:
+            amount = int(match.group(1))
+            unit = match.group(2).lower()
+            prompt = match.group(3).strip()
+            buf._text = POLL_START_RE.sub("", buf._text).strip()
+            return amount, unit, prompt
+
+        # Auto-detection fallback — Claude forgot POLL_START but promised to follow up
+        if _PROMISE_PATTERNS.search(buf._text):
+            logger.info("coordinator.auto_poll_injected", thread_ts=buf.thread_ts)
+            prompt = (
+                "You previously said you would follow up when the background task completed. "
+                "Check the relevant tmux session, workflow status, or file that you were waiting on, "
+                "and report the current state to the user. Include POLL_COMPLETE in your response "
+                "if the task is done or clearly failed."
+            )
+            return AUTO_POLL_INTERVAL_MIN, "m", prompt
+
+        return None
 
     # ── internals ────────────────────────────────────────────────────────────
 
