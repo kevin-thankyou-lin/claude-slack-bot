@@ -45,6 +45,117 @@ _PROMISE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 AUTO_POLL_INTERVAL_MIN = 3  # default polling interval if Claude forgot POLL_START
+ONGOING_POLL_INTERVAL_MIN = 5  # polling interval for ongoing work with no ETA
+
+# Signals that the task is definitively NOT ongoing — if any of these appear
+# prominently, we skip the ongoing-work auto-poll fallback.
+_TERMINAL_PATTERNS = re.compile(
+    r"\b(?:"
+    r"(?:all\s+)?(?:done|complete(?:d)?|finished|succeeded|ready|ship(?:ped)?|landed)\b"
+    r"|\bPOLL_COMPLETE\b"
+    r"|success(?:\s+rate)?[:=]\s*\d"
+    r"|exit(?:ed|ing)?\s+(?:code\s+)?0\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Signals that a background task is still in progress — running, training, evaluating,
+# setting up, building, rolling out, etc.  Used as the last auto-poll fallback
+# when there's no ETA and no explicit "will report back" promise.
+_ONGOING_PATTERNS = re.compile(
+    r"\b(?:"
+    r"still\s+(?:running|in\s+progress|waiting|pending|setting\s+up|building|training|evaluating|rolling\s+out|booting|warming\s+up|ongoing)"
+    r"|(?:currently|now|actively)\s+(?:running|building|training|evaluating|rolling\s+out|setting\s+up|booting)"
+    r"|setting\s+up(?:\s+envs?|\s+environments?)?"
+    r"|rolling\s+out"
+    r"|running\s+healthy"
+    r"|(?:alive|up)\s+(?:on|and\s+(?:running|healthy))"
+    r"|\bin\s+progress\b"
+    r"|\b(?:still\s+)?(?:pending|queued)\b"
+    r"|no\s+(?:JSONs?|results?|outputs?|logs?|ckpts?|checkpoints?)\s+yet"
+    r"|early\s+in\s+(?:the\s+)?(?:run|training|eval|build)"
+    r"|warming\s+up"
+    r"|eval(?:s|uation)?\s+(?:running|in\s+progress|underway)"
+    r"|training\s+(?:running|in\s+progress|underway)"
+    r"|build(?:ing)?\s+(?:in\s+progress|underway)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Detect predicted ETAs like "expected in ~10-20 min", "first JSONs in ~15 min",
+# "ckpt in ~30 min", "ETA ~5 min", "ready in about 2 hours". Group layout:
+#   1 = lower/single number, 2 = upper number (if range), 3 = unit word
+_ETA_RE = re.compile(
+    r"\b(?:in|ETA|within|expected|landing|coming|arriving|ready|finish(?:ed|ing)?|done)"
+    r"(?:\s+in)?"
+    r"\s+(?:~|about|approximately|roughly|around)?\s*"
+    r"(\d+)"
+    r"(?:\s*(?:[-\u2013\u2014]|\s+to\s+)\s*(\d+))?"
+    r"\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_eta_minutes(hi: str, lo: str | None, unit: str) -> int | None:
+    """Convert an ETA match to minutes, using the upper bound for ranges."""
+    n = int(lo) if lo else int(hi)
+    u = unit.lower()
+    if u in {"m", "min", "mins", "minute", "minutes"}:
+        return n
+    if u in {"h", "hr", "hrs", "hour", "hours"}:
+        return n * 60
+    if u in {"s", "sec", "secs", "second", "seconds"}:
+        return max(1, (n + 59) // 60)  # round up to nearest minute
+    return None
+
+
+def _pick_poll_interval(eta_minutes: int) -> int:
+    """Pick a polling interval (minutes) based on the predicted ETA.
+
+    - ETA <= 5m  -> poll every 2m
+    - 5 < ETA <= 30m -> poll every 3-5m
+    - 30 < ETA <= 120m -> poll every 10-15m
+    - ETA > 120m -> poll every 20-30m
+    """
+    if eta_minutes <= 5:
+        return 2
+    if eta_minutes <= 30:
+        return max(3, min(5, eta_minutes // 4))
+    if eta_minutes <= 120:
+        return max(10, min(15, eta_minutes // 6))
+    return max(20, min(30, eta_minutes // 8))
+
+
+def _extract_eta_subject(text: str, match_start: int) -> str:
+    """Pull a short subject from the ~80 chars before the ETA match."""
+    preceding = text[max(0, match_start - 80) : match_start]
+    # Drop any leading newline/sentence fragment — keep words from the current clause
+    # Split on sentence terminators and take the last fragment
+    for sep in (". ", "! ", "? ", "\n"):
+        if sep in preceding:
+            preceding = preceding.rsplit(sep, 1)[-1]
+    words = preceding.split()
+    # Skip trailing connective words
+    while words and words[-1].lower() in {"in", "within", "expected", "ready", "coming", "eta", "is", "are"}:
+        words.pop()
+    tail = " ".join(words[-8:]).strip(".,:;!?-\u2013 ")
+    return tail or "the predicted event"
+
+
+def _find_earliest_eta(text: str) -> tuple[int, int, str] | None:
+    """Scan text for ETA phrases. Return (eta_minutes, match_start, subject) or None.
+
+    When multiple ETAs appear, pick the smallest (soonest) so we poll in time.
+    """
+    best: tuple[int, int, str] | None = None
+    for m in _ETA_RE.finditer(text):
+        minutes = _parse_eta_minutes(m.group(1), m.group(2), m.group(3))
+        if minutes is None or minutes <= 0 or minutes > 60 * 24:
+            continue  # skip nonsense (negative, zero, > 24h)
+        subject = _extract_eta_subject(text, m.start())
+        if best is None or minutes < best[0]:
+            best = (minutes, m.start(), subject)
+    return best
 
 
 class _StreamBuffer:
@@ -759,8 +870,11 @@ class ThreadCoordinator:
     def _extract_poll_request(self, buf: _StreamBuffer) -> tuple[int, str, str] | None:
         """Find and strip a POLL_START sentinel from the buffer. Returns (amount, unit, prompt).
 
-        Falls back to auto-detection: if Claude promised to follow up (e.g. "will report back")
-        without emitting an explicit POLL_START, synthesize a poll so the promise is honored.
+        Falls back to auto-detection:
+          1. If Claude predicted an ETA ("expected in ~15 min"), pick an interval
+             appropriate to the predicted time and synthesize a subject-aware poll.
+          2. Otherwise, if Claude promised to follow up ("will report back"),
+             synthesize a generic 3-minute poll so the promise is honored.
         """
         match = POLL_START_RE.search(buf._text)
         if match:
@@ -770,7 +884,27 @@ class ThreadCoordinator:
             buf._text = POLL_START_RE.sub("", buf._text).strip()
             return amount, unit, prompt
 
-        # Auto-detection fallback — Claude forgot POLL_START but promised to follow up
+        # Auto-detection #1: Claude predicted an ETA — poll at an interval scaled to it
+        eta_hit = _find_earliest_eta(buf._text)
+        if eta_hit is not None:
+            eta_minutes, _, subject = eta_hit
+            interval = _pick_poll_interval(eta_minutes)
+            logger.info(
+                "coordinator.auto_poll_from_eta",
+                thread_ts=buf.thread_ts,
+                eta_minutes=eta_minutes,
+                interval_minutes=interval,
+                subject=subject,
+            )
+            prompt = (
+                f"You previously predicted that '{subject}' would be ready in ~{eta_minutes} minutes. "
+                "Check the current status (the relevant tmux pane, workflow dashboard, log file, or output path) "
+                "and report to the user. Include POLL_COMPLETE in your response if the predicted event has "
+                "occurred or clearly failed."
+            )
+            return interval, "m", prompt
+
+        # Auto-detection #2: Claude promised to follow up but gave no ETA
         if _PROMISE_PATTERNS.search(buf._text):
             logger.info("coordinator.auto_poll_injected", thread_ts=buf.thread_ts)
             prompt = (
@@ -780,6 +914,19 @@ class ThreadCoordinator:
                 "if the task is done or clearly failed."
             )
             return AUTO_POLL_INTERVAL_MIN, "m", prompt
+
+        # Auto-detection #3: Claude reported ongoing status (training/eval/setup/etc.)
+        # with neither explicit ETA nor promise — still needs a poll so we learn when
+        # it's actually done.  Skip if the text also looks terminal (done/complete).
+        if _ONGOING_PATTERNS.search(buf._text) and not _TERMINAL_PATTERNS.search(buf._text):
+            logger.info("coordinator.auto_poll_from_ongoing", thread_ts=buf.thread_ts)
+            prompt = (
+                "A background task was reported as still in progress. Check its current state "
+                "(the relevant tmux pane, workflow dashboard, log file, or output path) and report "
+                "what has changed. Include POLL_COMPLETE in your response if the task is now done "
+                "or has clearly failed."
+            )
+            return ONGOING_POLL_INTERVAL_MIN, "m", prompt
 
         return None
 
@@ -908,9 +1055,7 @@ class ThreadCoordinator:
             # send "continue" to kick off the next turn automatically
             elif buf.has_content and self._should_auto_continue(buf._text):
                 logger.info("coordinator.auto_continue", thread_ts=thread_ts)
-                await self._process_message(
-                    thread_ts, channel_id, "continue", say, client, user_id=effective_user_id
-                )
+                await self._process_message(thread_ts, channel_id, "continue", say, client, user_id=effective_user_id)
 
         except Exception:
             logger.exception("coordinator.process_error", thread_ts=thread_ts)
@@ -932,24 +1077,34 @@ class ThreadCoordinator:
         if event.type == EventType.TOOL_ACTIVITY:
             # Keep watchdog alive during long tool-use turns
             from ..main import touch_watchdog  # noqa: PLC0415
+
             touch_watchdog()
             # Update the thinking message to show what tool Claude is using
             buf = self._stream_buffers.get(thread_ts)
             if buf and buf._thinking_ts and buf._thinking_channel:
-                tool_emoji = {"Bash": ":terminal:", "Read": ":eyes:", "Write": ":pencil2:", "Edit": ":pencil2:",
-                              "Grep": ":mag:", "Glob": ":mag:", "WebFetch": ":globe_with_meridians:",
-                              "WebSearch": ":mag_right:"}.get(event.tool_name, ":gear:")
+                tool_emoji = {
+                    "Bash": ":terminal:",
+                    "Read": ":eyes:",
+                    "Write": ":pencil2:",
+                    "Edit": ":pencil2:",
+                    "Grep": ":mag:",
+                    "Glob": ":mag:",
+                    "WebFetch": ":globe_with_meridians:",
+                    "WebSearch": ":mag_right:",
+                }.get(event.tool_name, ":gear:")
                 # Track tool call count
                 buf._tool_count = getattr(buf, "_tool_count", 0) + 1
                 try:
                     await client.chat_update(
-                        channel=buf._thinking_channel, ts=buf._thinking_ts,
+                        channel=buf._thinking_channel,
+                        ts=buf._thinking_ts,
                         text=f"{tool_emoji} Using {event.tool_name}... (step {buf._tool_count})",
                     )
                 except Exception:
                     pass
         elif event.type == EventType.TEXT_DELTA:
             from ..main import touch_watchdog  # noqa: PLC0415
+
             touch_watchdog()
             buf = self._stream_buffers.get(thread_ts)
             if buf:
