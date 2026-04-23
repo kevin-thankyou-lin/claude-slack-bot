@@ -719,10 +719,17 @@ class ThreadCoordinator:
         try:
             while True:
                 await asyncio.sleep(interval_secs)
+                # Keep the watchdog alive so it doesn't restart the process during long polls
+                from ..main import touch_watchdog  # noqa: PLC0415
+                touch_watchdog()
                 # Wait for any active task to finish first
                 active = self._active.get(thread_ts)
                 if active and not active.done():
                     logger.info("coordinator.poll_skipped_busy", thread_ts=thread_ts)
+                    buf = self._stream_buffers.get(thread_ts)
+                    tool_count = getattr(buf, "_tool_count", 0) if buf else 0
+                    status = f":hourglass: Agent still working ({tool_count} steps so far) — poll deferred to next tick."
+                    await say(text=status, thread_ts=thread_ts)
                     continue
 
                 logger.info("coordinator.poll_tick", thread_ts=thread_ts, prompt=prompt)
@@ -1109,11 +1116,15 @@ class ThreadCoordinator:
             buf = self._stream_buffers.get(thread_ts)
             if buf:
                 await buf.append(event.text)
-            # If no buffer (non-streaming backend), fall through to TEXT handling
         elif event.type == EventType.TEXT:
-            # If we have a stream buffer, the deltas already covered this text
             buf = self._stream_buffers.get(thread_ts)
-            if not buf or not buf.has_content:
+            if buf:
+                # Route through buf so finalize() handles posting + POLL_START detection.
+                # Covers non-streaming backends (messages API) that emit full TEXT events
+                # instead of TEXT_DELTA, and tool-result follow-up text within a turn.
+                await buf.append(event.text)
+            else:
+                # No active stream buffer (e.g., button-click approval handler) — post directly.
                 await self._handle_text(event, thread_ts, user_id, say)
         elif event.type == EventType.TOOL_CONFIRMATION_NEEDED:
             await self._handle_confirmation_needed(event, thread_ts, session_id, user_id, say, client)
