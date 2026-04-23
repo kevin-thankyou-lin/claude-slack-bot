@@ -622,7 +622,11 @@ class ThreadCoordinator:
                 self._active[thread_ts] = task
 
                 # Wait for this tick to finish so we can check the response
-                await task
+                try:
+                    await task
+                except Exception:
+                    logger.exception("coordinator.poll_tick_error", thread_ts=thread_ts)
+                    continue
 
                 # Check if Claude signalled completion via the stream buffer's final text
                 # The finalized text was stored in the DB — read the latest assistant message
