@@ -146,10 +146,10 @@ class _StreamBuffer:
 class ThreadCoordinator:
     """Maps Slack threads to agent sessions and orchestrates the conversation loop."""
 
-    def __init__(self, backend: Any, db: Database, projects_dir: str = "/home/linke/Projects") -> None:
+    def __init__(self, backend: Any, db: Database, projects_dir: str = "") -> None:
         self.backend = backend
         self.db = db
-        self.projects_dir = Path(projects_dir)
+        self.projects_dir = Path(projects_dir) if projects_dir else Path.home() / "Projects"
         self._active: dict[str, asyncio.Task[None]] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}
         self._polls: dict[str, asyncio.Task[None]] = {}  # thread_ts -> poll task
