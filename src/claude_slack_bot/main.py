@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import sys
 import time
 
 import structlog
@@ -59,15 +57,12 @@ def _create_backend(settings: Settings) -> ClaudeCodeBackend:
 
 
 async def _watchdog() -> None:
-    """Monitor the Slack connection and restart the process if it goes silent."""
+    """Log a warning if no Slack events arrive for an extended period."""
     while True:
         await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
         idle = time.monotonic() - _last_event_time
         if idle > WATCHDOG_TIMEOUT:
-            logger.error("watchdog.timeout", idle_seconds=int(idle))
-            logger.info("watchdog.restarting")
-            # Re-exec the process — clean restart, same args
-            os.execv(sys.executable, [sys.executable, "-m", "claude_slack_bot.main"])
+            logger.warning("watchdog.idle", idle_seconds=int(idle), msg="No Slack events — socket may be stale")
 
 
 async def main() -> None:
@@ -102,6 +97,9 @@ async def main() -> None:
         await next()
 
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
+
+    # Restore any polls that were active before shutdown/restart
+    await coordinator.restore_polls(app.client)
 
     # Start watchdog in background
     _wd = asyncio.create_task(_watchdog())  # noqa: RUF006

@@ -24,7 +24,8 @@ _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 
 
 AUTO_COMPACT_THRESHOLD = 150  # auto-compact after this many messages in a thread
-STREAM_FLUSH_INTERVAL = 3.0  # seconds between Slack message updates
+STREAM_FLUSH_INTERVAL = 5.0  # fallback: max seconds between Slack message updates
+STREAM_DEBOUNCE_DELAY = 0.4  # flush this long after the last token (primary trigger)
 STREAM_FIRST_POST_DELAY = 0.5  # wait this long before first post (avoids flicker for fast replies)
 
 # Sentinel Claude can include in its final response to self-schedule a poll.
@@ -180,12 +181,21 @@ class _StreamBuffer:
         # Set by coordinator to track the "Thinking..." message
         self._thinking_ts: str | None = None
         self._thinking_channel: str | None = None
+        self._debounce_task: asyncio.Task[None] | None = None
+
+    async def _debounced_flush(self) -> None:
+        await asyncio.sleep(STREAM_DEBOUNCE_DELAY)
+        await self.flush()
 
     async def append(self, delta: str) -> None:
         self._text += delta
         self._dirty = True
         if self._first_delta_time is None:
             self._first_delta_time = time.monotonic()
+        # Cancel any pending debounce and restart it — flush fires after the stream pauses
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._debounce_task = asyncio.create_task(self._debounced_flush())
 
     async def flush(self) -> None:
         if not self._dirty or not self._text:
@@ -231,6 +241,8 @@ class _StreamBuffer:
 
     async def finalize(self) -> str:
         """Post final text — no typing indicator. Mentions user to signal task complete."""
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
         self._dirty = False
         mention = f"<@{self._user_id}> " if self._user_id else ""
         final_text = mention + self._text if mention and self._text else self._text
@@ -261,10 +273,33 @@ class ThreadCoordinator:
         self.backend = backend
         self.db = db
         self.projects_dir = Path(projects_dir) if projects_dir else Path.home() / "Projects"
+        self._slack_client: Any = None
         self._active: dict[str, asyncio.Task[None]] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}
         self._polls: dict[str, asyncio.Task[None]] = {}  # thread_ts -> poll task
         self._queues: dict[str, asyncio.Queue[tuple[str, str, str, Any, Any, str]]] = {}  # thread_ts -> message queue
+
+    async def restore_polls(self, slack_client: Any) -> None:
+        """Re-register polls that were active before a restart."""
+        self._slack_client = slack_client
+        async with self.db._connect() as db:
+            polls = await queries.get_all_polls(db)
+        if not polls:
+            return
+        logger.info("coordinator.restoring_polls", count=len(polls))
+        for poll in polls:
+            def _make_say(channel_id: str, thread_ts: str) -> Any:
+                async def say(text: str, thread_ts: str = thread_ts, **_: Any) -> dict[str, Any]:
+                    return await slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=text)
+                return say
+
+            say = _make_say(poll.channel_id, poll.thread_ts)
+            poll_task = asyncio.create_task(
+                self._run_poll(poll.thread_ts, poll.channel_id, poll.prompt, poll.interval_secs, say, slack_client, poll.user_id)
+            )
+            self._polls[poll.thread_ts] = poll_task
+            await say(text=f":repeat: Poll resumed after restart — `{poll.prompt}` every {poll.interval_secs}s.")
+            logger.info("coordinator.poll_restored", thread_ts=poll.thread_ts, prompt=poll.prompt)
 
     async def handle_user_message(
         self,
@@ -495,6 +530,8 @@ class ThreadCoordinator:
         poll_task = self._polls.pop(thread_ts, None)
         if poll_task:
             poll_task.cancel()
+            async with self.db._connect() as db:
+                await queries.delete_poll(db, thread_ts)
 
         task = self._active.get(thread_ts)
         if task and not task.done():
@@ -518,6 +555,8 @@ class ThreadCoordinator:
         poll_task = self._polls.pop(thread_ts, None)
         if poll_task:
             poll_task.cancel()
+            async with self.db._connect() as db:
+                await queries.delete_poll(db, thread_ts)
 
         # Stop running task if any
         task = self._active.get(thread_ts)
@@ -642,6 +681,8 @@ class ThreadCoordinator:
             poll_task = self._polls.pop(thread_ts, None)
             if poll_task:
                 poll_task.cancel()
+                async with self.db._connect() as db:
+                    await queries.delete_poll(db, thread_ts)
                 await say(text=":octagonal_sign: Poll stopped.", thread_ts=thread_ts)
             else:
                 await say(text="No active poll in this thread.", thread_ts=thread_ts)
@@ -688,6 +729,10 @@ class ThreadCoordinator:
             self._run_poll(thread_ts, channel_id, prompt, interval_secs, say, client, user_id)
         )
         self._polls[thread_ts] = poll_task
+
+        async with self.db._connect() as db:
+            from ..db.models import Poll
+            await queries.upsert_poll(db, Poll(thread_ts=thread_ts, channel_id=channel_id, prompt=prompt, interval_secs=interval_secs, user_id=user_id))
 
         unit_label = f"{amount}{'m' if unit in ('m', 'min') else unit[0]}"
         await say(
@@ -755,6 +800,8 @@ class ThreadCoordinator:
                     if last_msg.role == "assistant" and "POLL_COMPLETE" in last_msg.content:
                         logger.info("coordinator.poll_auto_stopped", thread_ts=thread_ts)
                         self._polls.pop(thread_ts, None)
+                        async with self.db._connect() as db2:
+                            await queries.delete_poll(db2, thread_ts)
                         await say(text=":white_check_mark: Poll auto-stopped (task complete).", thread_ts=thread_ts)
                         return
 
@@ -1035,6 +1082,11 @@ class ThreadCoordinator:
                     final_text = await buf.finalize()
                     async with self.db._connect() as db_conn:
                         await queries.add_message(db_conn, thread_ts, "assistant", final_text)
+                    # Scan the assistant's response text for /tmp/ file paths and upload them.
+                    # scan_and_upload_files is also called in _handle_tool_use for the
+                    # messages/managed backends, but Claude Code runs tools in-process so
+                    # only TEXT events reach the coordinator — this is the only hook we have.
+                    await scan_and_upload_files(client, channel_id, thread_ts, "", final_text)
                 self._stream_buffers.pop(thread_ts, None)
 
             # Persist the Claude Code session ID for resume after restart

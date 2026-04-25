@@ -4,7 +4,7 @@ import json
 
 import aiosqlite
 
-from .models import Message, PendingConfirmation, Thread
+from .models import Message, PendingConfirmation, Poll, Thread
 
 # ── Threads ────────────────────────────────────────────────────────────────────
 
@@ -117,6 +117,44 @@ async def get_message_count(db: aiosqlite.Connection, thread_ts: str) -> int:
     async with db.execute("SELECT COUNT(*) FROM messages WHERE thread_ts = ?", (thread_ts,)) as cur:
         row = await cur.fetchone()
     return row[0] if row else 0
+
+
+# ── Polls ─────────────────────────────────────────────────────────────────────
+
+
+async def upsert_poll(db: aiosqlite.Connection, poll: Poll) -> None:
+    await db.execute(
+        """INSERT INTO polls (thread_ts, channel_id, prompt, interval_secs, user_id)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(thread_ts) DO UPDATE SET
+               channel_id = excluded.channel_id,
+               prompt = excluded.prompt,
+               interval_secs = excluded.interval_secs,
+               user_id = excluded.user_id""",
+        (poll.thread_ts, poll.channel_id, poll.prompt, poll.interval_secs, poll.user_id),
+    )
+    await db.commit()
+
+
+async def delete_poll(db: aiosqlite.Connection, thread_ts: str) -> None:
+    await db.execute("DELETE FROM polls WHERE thread_ts = ?", (thread_ts,))
+    await db.commit()
+
+
+async def get_all_polls(db: aiosqlite.Connection) -> list[Poll]:
+    db.row_factory = aiosqlite.Row
+    async with db.execute("SELECT * FROM polls") as cur:
+        rows = await cur.fetchall()
+    return [
+        Poll(
+            thread_ts=row["thread_ts"],
+            channel_id=row["channel_id"],
+            prompt=row["prompt"],
+            interval_secs=row["interval_secs"],
+            user_id=row["user_id"],
+        )
+        for row in rows
+    ]
 
 
 # ── Pending confirmations ─────────────────────────────────────────────────────

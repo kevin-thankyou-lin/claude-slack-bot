@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS pending_confirmations (
     resolved_at     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS polls (
+    thread_ts       TEXT PRIMARY KEY,
+    channel_id      TEXT NOT NULL,
+    prompt          TEXT NOT NULL,
+    interval_secs   INTEGER NOT NULL,
+    user_id         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_ts);
 CREATE INDEX IF NOT EXISTS idx_confirmations_thread ON pending_confirmations(thread_ts);
 CREATE INDEX IF NOT EXISTS idx_confirmations_status ON pending_confirmations(status);

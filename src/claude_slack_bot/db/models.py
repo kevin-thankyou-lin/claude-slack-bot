@@ -34,6 +34,16 @@ class Message:
 
 
 @dataclass
+class Poll:
+    thread_ts: str
+    channel_id: str
+    prompt: str
+    interval_secs: int
+    user_id: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
 class PendingConfirmation:
     tool_use_id: str
     thread_ts: str
