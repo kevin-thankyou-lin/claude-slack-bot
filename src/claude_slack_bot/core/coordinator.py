@@ -765,8 +765,8 @@ class ThreadCoordinator:
             while True:
                 await asyncio.sleep(interval_secs)
                 # Keep the watchdog alive so it doesn't restart the process during long polls
-                from ..main import touch_watchdog  # noqa: PLC0415
-                touch_watchdog()
+                from ..utils.watchdog import touch  # noqa: PLC0415
+                touch()
                 # Wait for any active task to finish first
                 active = self._active.get(thread_ts)
                 if active and not active.done():
@@ -1135,9 +1135,9 @@ class ThreadCoordinator:
     ) -> None:
         if event.type == EventType.TOOL_ACTIVITY:
             # Keep watchdog alive during long tool-use turns
-            from ..main import touch_watchdog  # noqa: PLC0415
+            from ..utils.watchdog import touch  # noqa: PLC0415
 
-            touch_watchdog()
+            touch()
             # Update the thinking message to show what tool Claude is using
             buf = self._stream_buffers.get(thread_ts)
             if buf and buf._thinking_ts and buf._thinking_channel:
@@ -1162,9 +1162,9 @@ class ThreadCoordinator:
                 except Exception:
                     pass
         elif event.type == EventType.TEXT_DELTA:
-            from ..main import touch_watchdog  # noqa: PLC0415
+            from ..utils.watchdog import touch  # noqa: PLC0415
 
-            touch_watchdog()
+            touch()
             buf = self._stream_buffers.get(thread_ts)
             if buf:
                 await buf.append(event.text)

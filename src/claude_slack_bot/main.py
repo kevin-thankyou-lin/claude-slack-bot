@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -12,22 +11,19 @@ from .core.coordinator import ThreadCoordinator
 from .core.permissions import PermissionManager
 from .db.database import Database
 from .slack.app import create_slack_app
+from .utils import watchdog
 from .utils.logging import setup_logging
 
 logger = structlog.get_logger()
 
-# Watchdog: restart if no activity for this many seconds
+# Watchdog: warn if no activity for this many seconds
 WATCHDOG_TIMEOUT = 600  # 10 minutes — must be longer than the longest turn
 WATCHDOG_CHECK_INTERVAL = 60  # check every minute
 
-# Shared timestamp updated by the Slack listener middleware
-_last_event_time: float = time.monotonic()
-
 
 def touch_watchdog() -> None:
-    """Called by Slack middleware on every event to prove the connection is alive."""
-    global _last_event_time  # noqa: PLW0603
-    _last_event_time = time.monotonic()
+    """Back-compat shim. Prefer `from .utils.watchdog import touch`."""
+    watchdog.touch()
 
 
 def _create_backend(settings: Settings) -> ClaudeCodeBackend:
@@ -60,7 +56,7 @@ async def _watchdog() -> None:
     """Log a warning if no Slack events arrive for an extended period."""
     while True:
         await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
-        idle = time.monotonic() - _last_event_time
+        idle = watchdog.idle_seconds()
         if idle > WATCHDOG_TIMEOUT:
             logger.warning("watchdog.idle", idle_seconds=int(idle), msg="No Slack events — socket may be stale")
 
@@ -93,7 +89,7 @@ async def main() -> None:
     # Add middleware that touches the watchdog on every event
     @app.middleware
     async def watchdog_middleware(body: object, next: object) -> None:
-        touch_watchdog()
+        watchdog.touch()
         await next()
 
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
