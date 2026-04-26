@@ -787,8 +787,10 @@ class ThreadCoordinator:
 
                 logger.info("coordinator.poll_tick", thread_ts=thread_ts, prompt=prompt)
                 await say(text=":arrows_counterclockwise: Poll check...", thread_ts=thread_ts)
+                # Use _process_and_drain so any user messages queued during the
+                # poll tick are drained immediately instead of getting stuck.
                 task = asyncio.create_task(
-                    self._process_message(thread_ts, channel_id, poll_prompt, say, client, user_id=user_id)
+                    self._process_and_drain(thread_ts, channel_id, poll_prompt, say, client, user_id=user_id)
                 )
                 self._active[thread_ts] = task
 
@@ -1003,13 +1005,20 @@ class ThreadCoordinator:
         client: Any,
         user_id: str = "",
     ) -> None:
-        """Process a message, then drain any queued messages for this thread."""
+        """Process a message, then drain any queued messages for this thread.
+
+        Loops until the queue is empty so messages that arrive during a drain
+        pass don't get stuck waiting for the next user interaction.
+        """
         await self._process_message(thread_ts, channel_id, text, say, client, user_id=user_id)
 
-        # Drain queued messages — combine all into one message
-        queue = self._queues.get(thread_ts)
-        if queue and not queue.empty():
-            parts = []
+        # Drain queued messages in a loop — messages that arrive while we're
+        # draining also get picked up before we yield control.
+        while True:
+            queue = self._queues.get(thread_ts)
+            if not queue or queue.empty():
+                break
+            parts: list[str] = []
             last_meta = None
             while not queue.empty():
                 last_meta = await queue.get()
