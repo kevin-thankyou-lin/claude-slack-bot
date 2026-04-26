@@ -535,7 +535,11 @@ class ThreadCoordinator:
 
         task = self._active.get(thread_ts)
         if task and not task.done():
-            # Interrupt the Claude process
+            # Interrupt the Claude process and tear down its client. Without the reset,
+            # the SDK session keeps buffered events from the cancelled turn and replays
+            # them as the head of the next send_message — looks like an off-by-one reply
+            # to the user. Reconnect happens lazily on the next message; cc_session_id
+            # is preserved so the conversation context survives.
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
             if thread and hasattr(self.backend, "interrupt"):
@@ -544,6 +548,10 @@ class ThreadCoordinator:
             task.cancel()
             self._active.pop(thread_ts, None)
             self._stream_buffers.pop(thread_ts, None)
+
+            if thread and hasattr(self.backend, "_reset_client"):
+                await self.backend._reset_client(thread.session_id)
+
             await say(text=":octagonal_sign: Stopped. Send a new message to continue.", thread_ts=thread_ts)
             logger.info("coordinator.stopped", thread_ts=thread_ts)
         else:
