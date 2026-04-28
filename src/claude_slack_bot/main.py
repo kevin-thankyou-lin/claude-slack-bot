@@ -5,7 +5,10 @@ import asyncio
 import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
+from .agent.backend import AgentBackend
 from .agent.claude_code import ClaudeCodeBackend
+from .agent.codex_cli import CodexCliBackend
+from .agent.router import BackendRouter
 from .config import Settings
 from .core.coordinator import ThreadCoordinator
 from .core.permissions import PermissionManager
@@ -26,14 +29,22 @@ def touch_watchdog() -> None:
     watchdog.touch()
 
 
-def _create_backend(settings: Settings) -> ClaudeCodeBackend:
-    """Create the appropriate agent backend based on config."""
-    if settings.default_backend == "claude-code":
-        return ClaudeCodeBackend(
+def _create_backend(settings: Settings) -> AgentBackend:
+    """Create all configured local backends and route per Slack thread."""
+    backends: dict[str, AgentBackend] = {
+        "claude-code": ClaudeCodeBackend(
             model=settings.default_model,
             cwd=settings.cwd or None,
             effort=settings.effort or None,
-        )
+        ),
+        "codex": CodexCliBackend(
+            model=settings.codex_model,
+            cwd=settings.cwd or None,
+            effort=settings.effort or None,
+            codex_bin=settings.codex_bin,
+            bypass_approvals_and_sandbox=settings.codex_bypass_approvals_and_sandbox,
+        ),
+    }
 
     if settings.default_backend == "managed":
         import anthropic
@@ -41,15 +52,21 @@ def _create_backend(settings: Settings) -> ClaudeCodeBackend:
         from .agent.managed import ManagedAgentBackend
 
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        return ManagedAgentBackend(client=client, agent_id=settings.agent_id, agent_version=settings.agent_version)  # type: ignore[return-value]
+        backends["managed"] = ManagedAgentBackend(
+            client=client,
+            agent_id=settings.agent_id,
+            agent_version=settings.agent_version,
+        )
 
-    # Default: messages API
-    import anthropic
+    if settings.default_backend == "messages":
+        import anthropic
 
-    from .agent.messages import MessagesBackend
+        from .agent.messages import MessagesBackend
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return MessagesBackend(client=client, model=settings.default_model)  # type: ignore[return-value]
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        backends["messages"] = MessagesBackend(client=client, model=settings.default_model)
+
+    return BackendRouter(backends, default_backend_type=settings.default_backend)
 
 
 async def _watchdog() -> None:
@@ -69,6 +86,7 @@ async def main() -> None:
         "bot.starting",
         backend=settings.default_backend,
         model=settings.default_model,
+        codex_model=settings.codex_model,
         effort=settings.effort,
     )
 

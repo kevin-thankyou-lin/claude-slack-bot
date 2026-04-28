@@ -28,6 +28,27 @@ class _FakeCoord:
         return self._fn(self, buf)
 
 
+class _ModelBackend:
+    def default_model_for_backend(self, backend_type: str) -> str:
+        return {
+            "claude-code": "claude-opus-4-7",
+            "codex": "gpt-5.4",
+        }[backend_type]
+
+
+def test_model_name_aliases() -> None:
+    coord = ThreadCoordinator(_ModelBackend(), None)
+
+    assert coord._normalize_model_name("gpt5.4") == "gpt-5.4"
+
+
+def test_model_for_backend_uses_backend_default_for_incompatible_model() -> None:
+    coord = ThreadCoordinator(_ModelBackend(), None)
+
+    assert coord._model_for_backend("codex", "claude-opus-4-7") == "gpt-5.4"
+    assert coord._model_for_backend("claude-code", "gpt-5.4") == "claude-opus-4-7"
+
+
 # ── _parse_eta_minutes ────────────────────────────────────────────────────────
 
 

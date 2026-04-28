@@ -1,8 +1,8 @@
 # claude-slack-bot
 
-Threaded Claude agent conversations in Slack. One thread = one task.
+Threaded Claude or Codex agent conversations in Slack. One thread = one task.
 
-Talk to Claude by @mentioning the bot in any channel. Claude responds in a thread, and all follow-up messages in that thread continue the same conversation. Claude can execute code, search the web, generate images and videos, and send files directly in the thread.
+Talk to the agent by @mentioning the bot in any channel. It responds in a thread, and all follow-up messages in that thread continue the same conversation. Claude and Codex can execute code, search the web, generate images and videos, and send files directly in the thread.
 
 ## Features
 
@@ -12,7 +12,8 @@ Talk to Claude by @mentioning the bot in any channel. Claude responds in a threa
 - **Permission system** — tool use requires approval via Slack buttons (Allow / Deny / Auto-approve)
 - **Auto-approve mode** — toggle per-thread to skip permission prompts
 - **Conversation summaries** — Claude automatically appends a summary to each response
-- **Three backends** — Claude Code CLI (uses your subscription, no API key), Messages API, or Managed Agents API
+- **Multiple backends** — Claude Code CLI, Codex CLI, Messages API, or Managed Agents API
+- **Per-thread backend switching** — use Codex by default and switch specific threads back to Claude
 
 ## Quick start
 
@@ -27,7 +28,7 @@ cp .env.example .env
 python -m claude_slack_bot.main
 ```
 
-> **No Anthropic API key?** The default `claude-code` backend uses your existing Claude subscription via the `claude` CLI. Just make sure you've run `claude auth` first.
+> **No Anthropic API key?** The default `codex` backend uses your Codex CLI login. Just make sure `codex` is installed and logged in. Claude threads remain available through `backend claude` after `claude auth`.
 
 ## Slack App Setup
 
@@ -107,15 +108,18 @@ Copy `.env.example` to `.env` and fill in:
 ```bash
 SLACK_BOT_TOKEN=xoxb-...          # From step 6
 SLACK_APP_TOKEN=xapp-...          # From step 2
-# That's it! No API key needed with the default claude-code backend.
+# That's it! No API key needed with the default codex backend after `codex login`.
 ```
 
 Optional settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEFAULT_BACKEND` | `claude-code` | `claude-code` (uses subscription), `messages` (API), or `managed` (beta) |
-| `DEFAULT_MODEL` | `sonnet` | `sonnet`, `opus`, `haiku`, or full model ID |
+| `DEFAULT_BACKEND` | `codex` | `codex`, `claude-code`, `messages` (API), or `managed` (beta) |
+| `DEFAULT_MODEL` | `claude-opus-4-7` | Claude model for `claude-code` / Messages |
+| `CODEX_MODEL` | `gpt-5.4` | Codex model for `codex` threads |
+| `CODEX_BIN` | `codex` | Codex CLI executable |
+| `CODEX_BYPASS_APPROVALS_AND_SANDBOX` | `true` | Run Codex non-interactively without CLI approval prompts |
 | `DB_PATH` | `data/claude_slack_bot.db` | SQLite database path |
 | `SUMMARY_INTERVAL_TURNS` | `5` | Post a summary every N turns |
 | `CONFIRMATION_TIMEOUT_SECONDS` | `300` | Auto-expire unanswered permission prompts |
@@ -131,6 +135,19 @@ Optional settings:
 ```
 
 Claude responds in a thread. All replies in that thread continue the conversation.
+
+### Switch backends
+
+Claude remains available as `claude-code`, and Codex is available as `codex`.
+
+```
+backend codex
+codex: inspect this repo and fix the failing tests
+backend claude
+claude: continue with the existing Claude path
+```
+
+`model <name>`, `effort <level>`, and `cd <path>` continue to apply to the current thread.
 
 ### Permission prompts
 
@@ -184,12 +201,14 @@ python -m claude_slack_bot.main
 Slack (Socket Mode)
   → Slack Bolt event router
   → ThreadCoordinator (thread_ts ↔ agent session)
-  → AgentBackend (Messages API or Managed Agents)
+  → BackendRouter (Claude Code, Codex CLI, Messages API, or Managed Agents)
   → Response → Slack thread
 ```
 
 - **ThreadCoordinator** maps each Slack thread to an agent session
 - **PermissionManager** tracks auto-approve state per thread
+- **ClaudeCodeBackend** uses Claude Code CLI sessions
+- **CodexCliBackend** uses Codex CLI non-interactive runs
 - **MessagesBackend** uses the stable Anthropic Messages API with a local agentic loop
 - **ManagedAgentBackend** uses the beta Managed Agents API for stateful server-side sessions
 - **SQLite** persists thread mappings, message history, and pending confirmations

@@ -32,16 +32,14 @@ class AgentBackend(Protocol):
         """Create a new agent session, return a session identifier."""
         ...
 
-    async def send_message(self, session_id: str, content: str) -> AsyncIterator[SessionEvent]:
+    def send_message(self, session_id: str, content: str) -> AsyncIterator[SessionEvent]:
         """Send a user message and yield response events."""
         ...
 
-    async def send_tool_result(self, session_id: str, tool_use_id: str, result: str) -> AsyncIterator[SessionEvent]:
+    def send_tool_result(self, session_id: str, tool_use_id: str, result: str) -> AsyncIterator[SessionEvent]:
         """Send a tool result back to the session and yield follow-up events."""
         ...
 
-    async def send_tool_confirmation(
-        self, session_id: str, tool_use_id: str, allowed: bool
-    ) -> AsyncIterator[SessionEvent]:
+    def send_tool_confirmation(self, session_id: str, tool_use_id: str, allowed: bool) -> AsyncIterator[SessionEvent]:
         """Send a tool confirmation (allow/deny) and yield follow-up events."""
         ...

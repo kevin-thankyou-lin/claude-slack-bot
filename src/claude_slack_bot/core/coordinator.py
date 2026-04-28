@@ -4,23 +4,27 @@ import asyncio
 import json
 import re
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from ..agent.backend import EventType, SessionEvent
+from ..agent.router import normalize_backend_type
 from ..core.media import handle_custom_tool
 from ..db import queries
 from ..db.database import Database
-from ..db.models import Thread
+from ..db.models import Poll, Thread
 from ..slack.blocks import build_permission_block, build_summary_block
 from ..slack.file_upload import scan_and_upload_files
 
 logger = structlog.get_logger()
 
 _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
+_MODEL_ALIASES = {
+    "gpt5.4": "gpt-5.4",
+    "gpt-54": "gpt-5.4",
+}
 
 
 AUTO_COMPACT_THRESHOLD = 150  # auto-compact after this many messages in a thread
@@ -182,6 +186,7 @@ class _StreamBuffer:
         self._thinking_ts: str | None = None
         self._thinking_channel: str | None = None
         self._debounce_task: asyncio.Task[None] | None = None
+        self._tool_count = 0
 
     async def _debounced_flush(self) -> None:
         await asyncio.sleep(STREAM_DEBOUNCE_DELAY)
@@ -288,14 +293,23 @@ class ThreadCoordinator:
             return
         logger.info("coordinator.restoring_polls", count=len(polls))
         for poll in polls:
+
             def _make_say(channel_id: str, thread_ts: str) -> Any:
-                async def say(text: str, thread_ts: str = thread_ts, **_: Any) -> dict[str, Any]:
+                async def _say(
+                    text: str,
+                    thread_ts: str = thread_ts,
+                    channel_id: str = channel_id,
+                    **_: Any,
+                ) -> dict[str, Any]:
                     return await slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=text)
-                return say
+
+                return _say
 
             say = _make_say(poll.channel_id, poll.thread_ts)
             poll_task = asyncio.create_task(
-                self._run_poll(poll.thread_ts, poll.channel_id, poll.prompt, poll.interval_secs, say, slack_client, poll.user_id)
+                self._run_poll(
+                    poll.thread_ts, poll.channel_id, poll.prompt, poll.interval_secs, say, slack_client, poll.user_id
+                )
             )
             self._polls[poll.thread_ts] = poll_task
             await say(text=f":repeat: Poll resumed after restart — `{poll.prompt}` every {poll.interval_secs}s.")
@@ -321,17 +335,31 @@ class ThreadCoordinator:
             remaining = (cd_match.group(2) or "").strip()
             await self._handle_cd(thread_ts, channel_id, cd_path, say, user_id=user_id)
             if remaining:
-                # Process the rest as a normal message
-                if thread_ts in self._active and not self._active[thread_ts].done():
-                    logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
-                    await say(
-                        text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts
-                    )
-                else:
-                    task = asyncio.create_task(
-                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
-                    )
-                    self._active[thread_ts] = task
+                await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
+            return
+
+        # Handle backend command: "backend codex", "backend claude", optionally followed by a prompt.
+        backend_match = re.match(
+            r"^(?:backend|agent)\s+(\S+)\s*(.*)?$",
+            text.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if backend_match:
+            backend_name = backend_match.group(1).strip()
+            remaining = (backend_match.group(2) or "").strip()
+            changed = await self._handle_backend(thread_ts, channel_id, backend_name, say, user_id=user_id)
+            if changed:
+                await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
+            return
+
+        # Shortcut: "codex: prompt" / "claude: prompt" switches then runs the prompt.
+        backend_prefix_match = re.match(r"^(codex|claude)\s*:\s*(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
+        if backend_prefix_match:
+            backend_name = backend_prefix_match.group(1).strip()
+            remaining = backend_prefix_match.group(2).strip()
+            changed = await self._handle_backend(thread_ts, channel_id, backend_name, say, user_id=user_id)
+            if changed:
+                await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
             return
 
         # Handle model command: "model sonnet" or "model opus"
@@ -341,11 +369,7 @@ class ThreadCoordinator:
             remaining = (model_match.group(2) or "").strip()
             await self._handle_model(thread_ts, channel_id, model_name, say, user_id=user_id)
             if remaining:
-                if thread_ts not in self._active or self._active[thread_ts].done():
-                    task = asyncio.create_task(
-                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
-                    )
-                    self._active[thread_ts] = task
+                await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
             return
 
         # Handle effort command: "effort high" or "effort low"
@@ -355,11 +379,7 @@ class ThreadCoordinator:
             remaining = (effort_match.group(2) or "").strip()
             await self._handle_effort(thread_ts, channel_id, effort_val, say, user_id=user_id)
             if remaining:
-                if thread_ts not in self._active or self._active[thread_ts].done():
-                    task = asyncio.create_task(
-                        self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
-                    )
-                    self._active[thread_ts] = task
+                await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
             return
 
         # Handle poll command: "poll 10m check status" or "poll stop"
@@ -431,24 +451,146 @@ class ThreadCoordinator:
 
         return None
 
+    def _default_backend_type(self) -> str:
+        return str(getattr(self.backend, "default_backend_type", "messages"))
+
+    def _available_backend_types(self) -> tuple[str, ...]:
+        if hasattr(self.backend, "available_backend_types"):
+            return self.backend.available_backend_types()
+        return (self._default_backend_type(),)
+
+    async def _create_session(self, backend_type: str | None = None) -> str:
+        if backend_type and hasattr(self.backend, "available_backend_types"):
+            return await self.backend.create_session(backend_type=backend_type)
+        return await self.backend.create_session()
+
+    def _register_thread_backend(self, thread: Thread) -> None:
+        if hasattr(self.backend, "register_session"):
+            self.backend.register_session(thread.session_id, thread.backend_type)
+
+    def _normalize_requested_backend(self, backend_name: str) -> str | None:
+        backend_type = normalize_backend_type(backend_name)
+        if backend_type in self._available_backend_types():
+            return backend_type
+        return None
+
+    def _normalize_model_name(self, model_name: str) -> str:
+        key = model_name.strip().lower().replace("_", "-")
+        return _MODEL_ALIASES.get(key, model_name.strip())
+
+    def _default_model_for_backend(self, backend_type: str) -> str:
+        if hasattr(self.backend, "default_model_for_backend"):
+            return str(self.backend.default_model_for_backend(backend_type))
+        return str(getattr(self.backend, "model", ""))
+
+    def _model_for_backend(self, backend_type: str, model_name: str) -> str:
+        model = self._normalize_model_name(model_name)
+        if not model:
+            return ""
+
+        normalized_backend = normalize_backend_type(backend_type)
+        lower_model = model.lower()
+        if normalized_backend == "codex" and lower_model.startswith("claude-"):
+            return self._default_model_for_backend("codex")
+        if normalized_backend == "claude-code" and lower_model.startswith(("gpt-", "o")):
+            return self._default_model_for_backend("claude-code")
+        return model
+
+    async def _run_remaining_after_command(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        remaining: str,
+        say: Any,
+        client: Any,
+        user_id: str,
+    ) -> None:
+        if not remaining:
+            return
+        if thread_ts in self._active and not self._active[thread_ts].done():
+            logger.warning("coordinator.thread_busy", thread_ts=thread_ts)
+            await say(text=":hourglass: Still working on the previous request... please wait.", thread_ts=thread_ts)
+            return
+        task = asyncio.create_task(
+            self._process_message(thread_ts, channel_id, remaining, say, client, user_id=user_id)
+        )
+        self._active[thread_ts] = task
+
+    async def _handle_backend(
+        self,
+        thread_ts: str,
+        channel_id: str,
+        backend_name: str,
+        say: Any,
+        user_id: str = "",
+    ) -> bool:
+        """Switch this Slack thread to a concrete backend."""
+        backend_type = self._normalize_requested_backend(backend_name)
+        if backend_type is None:
+            available = ", ".join(self._available_backend_types())
+            await say(text=f":x: Unknown backend `{backend_name}`. Available: {available}", thread_ts=thread_ts)
+            return False
+
+        async with self.db._connect() as db:
+            thread = await queries.get_thread(db, thread_ts)
+
+        if thread is not None:
+            self._register_thread_backend(thread)
+
+        if thread and thread.backend_type == backend_type:
+            await self._sync_backend_state(thread)
+            await say(text=f":twisted_rightwards_arrows: Backend already set to `{backend_type}`", thread_ts=thread_ts)
+            return True
+
+        if thread and hasattr(self.backend, "_reset_client"):
+            await self.backend._reset_client(thread.session_id)
+
+        session_id = await self._create_session(backend_type)
+        if thread is None:
+            thread = Thread(
+                thread_ts=thread_ts,
+                channel_id=channel_id,
+                session_id=session_id,
+                backend_type=backend_type,
+                user_id=user_id,
+            )
+        else:
+            thread.session_id = session_id
+            thread.backend_type = backend_type
+            thread.cc_session_id = ""
+            if user_id and not thread.user_id:
+                thread.user_id = user_id
+
+        async with self.db._connect() as db:
+            await queries.upsert_thread(db, thread)
+
+        self._register_thread_backend(thread)
+        await self._sync_backend_state(thread)
+        await say(text=f":twisted_rightwards_arrows: Backend set to `{backend_type}`", thread_ts=thread_ts)
+        logger.info("coordinator.backend_set", thread_ts=thread_ts, backend_type=backend_type)
+        return True
+
     async def _handle_model(
         self, thread_ts: str, channel_id: str, model_name: str, say: Any, user_id: str = ""
     ) -> None:
         """Set the model for a thread. Disconnects the client so it reconnects with the new model."""
+        model_name = self._normalize_model_name(model_name)
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
             if thread is None:
-                session_id = await self.backend.create_session()
+                backend_type = self._default_backend_type()
+                session_id = await self._create_session(backend_type)
                 thread = Thread(
                     thread_ts=thread_ts,
                     channel_id=channel_id,
                     session_id=session_id,
-                    backend_type="claude-code",
+                    backend_type=backend_type,
                     model=model_name,
                     user_id=user_id,
                 )
                 await queries.upsert_thread(db, thread)
             else:
+                self._register_thread_backend(thread)
                 thread.model = model_name
                 await queries.upsert_thread(db, thread)
 
@@ -463,7 +605,7 @@ class ThreadCoordinator:
         self, thread_ts: str, channel_id: str, effort_val: str, say: Any, user_id: str = ""
     ) -> None:
         """Set the effort level for a thread."""
-        valid = ("low", "medium", "high", "max")
+        valid = ("low", "medium", "high", "xhigh", "max")
         if effort_val not in valid:
             await say(text=f":x: Invalid effort. Use one of: {', '.join(valid)}", thread_ts=thread_ts)
             return
@@ -471,17 +613,19 @@ class ThreadCoordinator:
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
             if thread is None:
-                session_id = await self.backend.create_session()
+                backend_type = self._default_backend_type()
+                session_id = await self._create_session(backend_type)
                 thread = Thread(
                     thread_ts=thread_ts,
                     channel_id=channel_id,
                     session_id=session_id,
-                    backend_type="claude-code",
+                    backend_type=backend_type,
                     effort=effort_val,
                     user_id=user_id,
                 )
                 await queries.upsert_thread(db, thread)
             else:
+                self._register_thread_backend(thread)
                 thread.effort = effort_val
                 await queries.upsert_thread(db, thread)
 
@@ -504,17 +648,19 @@ class ThreadCoordinator:
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
             if thread is None:
-                session_id = await self.backend.create_session()
+                backend_type = self._default_backend_type()
+                session_id = await self._create_session(backend_type)
                 thread = Thread(
                     thread_ts=thread_ts,
                     channel_id=channel_id,
                     session_id=session_id,
-                    backend_type="claude-code",
+                    backend_type=backend_type,
                     cwd=str(resolved),
                     user_id=user_id,
                 )
                 await queries.upsert_thread(db, thread)
             else:
+                self._register_thread_backend(thread)
                 await queries.set_cwd(db, thread_ts, str(resolved))
 
         # Tell the backend which cwd this session should use
@@ -535,13 +681,12 @@ class ThreadCoordinator:
 
         task = self._active.get(thread_ts)
         if task and not task.done():
-            # Interrupt the Claude process and tear down its client. Without the reset,
-            # the SDK session keeps buffered events from the cancelled turn and replays
-            # them as the head of the next send_message — looks like an off-by-one reply
-            # to the user. Reconnect happens lazily on the next message; cc_session_id
-            # is preserved so the conversation context survives.
+            # Interrupt the agent process and tear down its client so buffered events
+            # from a cancelled turn do not leak into the next request.
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
+            if thread:
+                self._register_thread_backend(thread)
             if thread and hasattr(self.backend, "interrupt"):
                 await self.backend.interrupt(thread.session_id)
 
@@ -571,6 +716,8 @@ class ThreadCoordinator:
         if task and not task.done():
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
+            if thread:
+                self._register_thread_backend(thread)
             if thread and hasattr(self.backend, "interrupt"):
                 await self.backend.interrupt(thread.session_id)
             task.cancel()
@@ -580,6 +727,8 @@ class ThreadCoordinator:
         # Disconnect the client to free resources
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
+        if thread:
+            self._register_thread_backend(thread)
         if thread and hasattr(self.backend, "_reset_client"):
             await self.backend._reset_client(thread.session_id)
 
@@ -606,6 +755,8 @@ class ThreadCoordinator:
         if task and not task.done():
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
+            if thread:
+                self._register_thread_backend(thread)
             if thread and hasattr(self.backend, "interrupt"):
                 await self.backend.interrupt(thread.session_id)
             task.cancel()
@@ -615,6 +766,7 @@ class ThreadCoordinator:
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
         if thread:
+            self._register_thread_backend(thread)
             if hasattr(self.backend, "_reset_client"):
                 await self.backend._reset_client(thread.session_id)
             thread.cc_session_id = ""
@@ -739,8 +891,16 @@ class ThreadCoordinator:
         self._polls[thread_ts] = poll_task
 
         async with self.db._connect() as db:
-            from ..db.models import Poll
-            await queries.upsert_poll(db, Poll(thread_ts=thread_ts, channel_id=channel_id, prompt=prompt, interval_secs=interval_secs, user_id=user_id))
+            await queries.upsert_poll(
+                db,
+                Poll(
+                    thread_ts=thread_ts,
+                    channel_id=channel_id,
+                    prompt=prompt,
+                    interval_secs=interval_secs,
+                    user_id=user_id,
+                ),
+            )
 
         unit_label = f"{amount}{'m' if unit in ('m', 'min') else unit[0]}"
         await say(
@@ -774,6 +934,7 @@ class ThreadCoordinator:
                 await asyncio.sleep(interval_secs)
                 # Keep the watchdog alive so it doesn't restart the process during long polls
                 from ..utils.watchdog import touch  # noqa: PLC0415
+
                 touch()
                 # Wait for any active task to finish first
                 active = self._active.get(thread_ts)
@@ -781,7 +942,9 @@ class ThreadCoordinator:
                     logger.info("coordinator.poll_skipped_busy", thread_ts=thread_ts)
                     buf = self._stream_buffers.get(thread_ts)
                     tool_count = getattr(buf, "_tool_count", 0) if buf else 0
-                    status = f":hourglass: Agent still working ({tool_count} steps so far) — poll deferred to next tick."
+                    status = (
+                        f":hourglass: Agent still working ({tool_count} steps so far) — poll deferred to next tick."
+                    )
                     await say(text=status, thread_ts=thread_ts)
                     continue
 
@@ -826,11 +989,15 @@ class ThreadCoordinator:
         user_id: str = "",
     ) -> None:
         """Process a side-channel 'btw' question on a temporary session."""
-        btw_session = f"btw-{uuid.uuid4().hex}"
+        btw_session = ""
         try:
             # Copy the thread's cwd to the temp session
             async with self.db._connect() as db:
                 thread = await queries.get_thread(db, thread_ts)
+            backend_type = thread.backend_type if thread else self._default_backend_type()
+            if thread:
+                self._register_thread_backend(thread)
+            btw_session = await self._create_session(backend_type)
             if thread and thread.cwd and hasattr(self.backend, "set_session_cwd"):
                 await self.backend.set_session_cwd(btw_session, thread.cwd)
 
@@ -885,6 +1052,7 @@ class ThreadCoordinator:
             thread = await queries.get_thread(db, thread_ts)
             if thread is None:
                 return
+            self._register_thread_backend(thread)
 
             await queries.resolve_confirmation(db, tool_use_id, "allowed" if allowed else "denied")
 
@@ -906,12 +1074,15 @@ class ThreadCoordinator:
 
     async def _sync_backend_state(self, thread: Thread) -> None:
         """Push per-thread settings (auto-approve, cwd, resume ID) into the backend."""
+        self._register_thread_backend(thread)
         if thread.auto_approve and hasattr(self.backend, "set_auto_approve"):
             self.backend.set_auto_approve(thread.session_id, enabled=True)
         if thread.cwd and hasattr(self.backend, "set_session_cwd"):
             await self.backend.set_session_cwd(thread.session_id, thread.cwd)
         if thread.model and hasattr(self.backend, "set_session_model"):
-            await self.backend.set_session_model(thread.session_id, thread.model)
+            model = self._model_for_backend(thread.backend_type, thread.model)
+            if model:
+                await self.backend.set_session_model(thread.session_id, model)
         if thread.effort and hasattr(self.backend, "set_session_effort"):
             await self.backend.set_session_effort(thread.session_id, thread.effort)
         if thread.cc_session_id and hasattr(self.backend, "set_cc_session_id"):
@@ -1034,12 +1205,13 @@ class ThreadCoordinator:
                 thread = await queries.get_thread(db, thread_ts)
 
             if thread is None:
-                session_id = await self.backend.create_session()
+                backend_type = self._default_backend_type()
+                session_id = await self._create_session(backend_type)
                 thread = Thread(
                     thread_ts=thread_ts,
                     channel_id=channel_id,
                     session_id=session_id,
-                    backend_type="messages",
+                    backend_type=backend_type,
                     user_id=user_id,
                 )
                 async with self.db._connect() as db:
@@ -1047,6 +1219,7 @@ class ThreadCoordinator:
                     await queries.add_message(db, thread_ts, "user", text)
                 logger.info("coordinator.new_thread", thread_ts=thread_ts, session_id=session_id)
             else:
+                self._register_thread_backend(thread)
                 # Backfill user_id if it wasn't stored on the original thread
                 if not thread.user_id and user_id:
                     thread.user_id = user_id
@@ -1209,6 +1382,8 @@ class ThreadCoordinator:
     ) -> None:
         async with self.db._connect() as db:
             thread = await queries.get_thread(db, thread_ts)
+        if thread:
+            self._register_thread_backend(thread)
 
         if thread and thread.auto_approve:
             result = await self._execute_tool(event.tool_name, event.tool_input)
