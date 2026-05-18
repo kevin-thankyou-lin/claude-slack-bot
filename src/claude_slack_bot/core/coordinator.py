@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,10 @@ _CUSTOM_TOOLS = frozenset(("generate_image", "create_video", "post_summary"))
 _MODEL_ALIASES = {
     "gpt5.4": "gpt-5.4",
     "gpt-54": "gpt-5.4",
+}
+_MOUNT_ROOT_ALIASES = {
+    "mnt": Path("/mnt"),
+    "mtn": Path("/mnt"),
 }
 
 
@@ -327,12 +332,12 @@ class ThreadCoordinator:
         """Route a user message to the appropriate agent session."""
         logger.debug("coordinator.incoming", thread_ts=thread_ts, text=text[:100])
 
-        # Handle `cd <path>` — optionally followed by a message on the same line
-        # e.g. "cd gr00t" or "cd gr00t check the eval results"
-        cd_match = re.match(r"^cd\s+(\S+)\s*(.*)?$", text.strip(), re.DOTALL)
+        # Handle `cd <path>` — optionally followed by a message on the same line.
+        # Supports full paths, project folder names, and mount shorthand like
+        # "cd mnt amlfs-07 shared linke run eval".
+        cd_match = re.match(r"^cd\s+(.+)$", text.strip(), re.DOTALL)
         if cd_match:
-            cd_path = cd_match.group(1).strip()
-            remaining = (cd_match.group(2) or "").strip()
+            cd_path, remaining = self._split_cd_target(cd_match.group(1).strip())
             await self._handle_cd(thread_ts, channel_id, cd_path, say, user_id=user_id)
             if remaining:
                 await self._run_remaining_after_command(thread_ts, channel_id, remaining, say, client, user_id)
@@ -431,11 +436,67 @@ class ThreadCoordinator:
         task = asyncio.create_task(self._process_and_drain(thread_ts, channel_id, text, say, client, user_id))
         self._active[thread_ts] = task
 
+    def _split_cd_target(self, tail: str) -> tuple[str, str]:
+        """Split a `cd` command tail into the directory target and trailing prompt."""
+        if not tail:
+            return "", ""
+
+        try:
+            parts = shlex.split(tail)
+        except ValueError:
+            parts = tail.split()
+
+        if not parts:
+            return "", ""
+
+        for end in range(len(parts), 0, -1):
+            candidate = " ".join(parts[:end])
+            if self._resolve_cwd(candidate) is not None:
+                return candidate, " ".join(parts[end:])
+
+        return parts[0], " ".join(parts[1:])
+
+    @staticmethod
+    def _normalize_path_component(component: str) -> str:
+        lower = component.lower()
+        if lower == "amfls":
+            return "amlfs"
+        for prefix in ("amlfs-", "amfls-"):
+            if lower.startswith(prefix):
+                suffix = component[len(prefix) :]
+                if suffix.isdigit():
+                    return f"amlfs-{int(suffix):02d}"
+                return f"amlfs-{suffix}"
+        return component
+
+    def _resolve_mount_phrase(self, path: str) -> Path | None:
+        """Resolve slashless mount paths like `mnt amlfs-07 shared linke`."""
+        parts = path.split()
+        if len(parts) < 2:
+            return None
+
+        root = _MOUNT_ROOT_ALIASES.get(parts[0].lower())
+        if root is None:
+            return None
+
+        candidate = root
+        for part in parts[1:]:
+            candidate /= self._normalize_path_component(part)
+
+        candidate = candidate.expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+        return None
+
     def _resolve_cwd(self, path: str) -> Path | None:
         """Resolve a path or folder name to an absolute directory."""
         # Try as absolute path first
         candidate = Path(path).expanduser().resolve()
         if candidate.is_dir():
+            return candidate
+
+        candidate = self._resolve_mount_phrase(path)
+        if candidate is not None:
             return candidate
 
         # Try as a folder name under projects_dir

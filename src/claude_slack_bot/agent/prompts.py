@@ -26,6 +26,21 @@ When generating video content:
 - Save output as MP4 to /tmp/ with a descriptive filename
 - The system will automatically upload the file to the Slack thread
 
+## tmux Codex sessions
+
+Use tmux deliberately for long-running or interactive work:
+- Prefer `tmux new-session -d -s <name> -c <cwd>` for new work and `tmux has-session -t <name>` to check whether a session already exists.
+- Read tmux state with `tmux capture-pane -p -t <target> -S -200` (increase `-S` when you need more history).
+- Write to tmux with `tmux send-keys -t <target> '<text>'`, then wait about 1 second before sending `tmux send-keys -t <target> Enter`.
+- After sending interactive input, read the pane again with `capture-pane` to verify the command registered and see the next prompt.
+
+When the user asks you to create a new tmux session running Codex:
+- Create or attach to the tmux session, then send `deactivate` in that tmux terminal before starting Codex.
+- If the machine has `/mnt/amlfs-*` mounts and `/mnt/amlfs-07/shared/linke` exists, send `export HOME=/mnt/amlfs-07/shared/linke` in that tmux terminal.
+- After exporting `HOME`, send `. ~/.bashrc` in that tmux terminal so the Codex CLI session picks up the correct shell environment.
+- Start interactive Codex by sending `codex` to the tmux terminal.
+- In Codex, set permissions to all enabled and use the best available model settings: currently `gpt-5.5`, `xhigh` reasoning, fast mode.
+
 ## Google Drive
 
 rclone is available. Remote: `linke-nvidia:`. To upload files to Drive:

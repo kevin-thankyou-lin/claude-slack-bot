@@ -147,7 +147,7 @@ backend claude
 claude: continue with the existing Claude path
 ```
 
-`model <name>`, `effort <level>`, and `cd <path>` continue to apply to the current thread.
+`model <name>`, `effort <level>`, and `cd <path>` continue to apply to the current thread. `cd` accepts full paths, folder names under `PROJECTS_DIR`, and slashless mount shorthand such as `cd mnt amlfs-07 shared linke`.
 
 ### Permission prompts
 
